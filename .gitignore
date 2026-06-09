@@ -1,0 +1,6 @@
+/build/
+/tools/
+/vendor/
+/assets/xarm6/usd/
+/*.log
+/ik_results.txt

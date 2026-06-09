@@ -1,0 +1,24 @@
+api_version: 1.0
+
+cspace:
+  - joint1
+  - joint2
+  - joint3
+  - joint4
+  - joint5
+  - joint6
+
+default_q: [0.0, -0.52, -1.05, 0.0, 1.57, 0.0]
+
+acceleration_limits: [6.0, 6.0, 6.0, 8.0, 8.0, 8.0]
+jerk_limits: [1000.0, 1000.0, 1000.0, 1500.0, 1500.0, 1500.0]
+
+cspace_to_urdf_rules:
+  - {name: drive_joint, rule: fixed, value: 0.85}
+  - {name: left_finger_joint, rule: fixed, value: 0.85}
+  - {name: left_inner_knuckle_joint, rule: fixed, value: 0.85}
+  - {name: right_outer_knuckle_joint, rule: fixed, value: 0.85}
+  - {name: right_finger_joint, rule: fixed, value: 0.85}
+  - {name: right_inner_knuckle_joint, rule: fixed, value: 0.85}
+
+collision_spheres: []
