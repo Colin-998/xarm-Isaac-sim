@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 from isaacsim import SimulationApp
@@ -6,6 +7,16 @@ from isaacsim import SimulationApp
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--headless", action="store_true")
+parser.add_argument(
+    "--random-seed",
+    type=int,
+    help="Randomize the cube position within the calibrated grasp region.",
+)
+parser.add_argument(
+    "--record-dir",
+    type=Path,
+    help="Write 4 FPS 256x256 RGB frames and action JSONL to this directory.",
+)
 args, _ = parser.parse_known_args()
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +32,9 @@ app = SimulationApp(
 )
 
 import numpy as np
+import carb.settings
+import omni.physx
+import omni.replicator.core as rep
 import omni.timeline
 import omni.usd
 from isaacsim.core.api import World
@@ -30,11 +44,19 @@ from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.robot_motion.motion_generation import ArticulationKinematicsSolver, LulaKinematicsSolver
-from pxr import Gf, Sdf, UsdGeom, UsdPhysics
+from PIL import Image
+from pxr import PhysicsSchemaTools, PhysxSchema, Usd, UsdGeom, UsdPhysics, UsdShade
 
 
-CUBE_POSITION = np.array([0.35, 0.0, 0.03])
-CUBE_SIZE = 0.055
+CUBE_POSITION = np.array([0.33, 0.0, 0.020])
+CUBE_SIZE = 0.040
+if args.random_seed is not None:
+    rng = np.random.default_rng(args.random_seed)
+    CUBE_POSITION[:2] += rng.uniform(
+        low=np.array([-0.006, -0.012]),
+        high=np.array([0.006, 0.012]),
+    )
+GRASP_CENTER_OFFSET = np.zeros(3)
 DOWNWARD = np.array([0.0, 1.0, 0.0, 0.0])
 GRIPPER_JOINTS = [
     "drive_joint",
@@ -44,6 +66,71 @@ GRIPPER_JOINTS = [
     "left_finger_joint",
     "right_finger_joint",
 ]
+GRIPPER_CONTROL_JOINTS = GRIPPER_JOINTS
+contact_stats = {
+    "left_finger": {"count": 0, "impulse": 0.0},
+    "right_finger": {"count": 0, "impulse": 0.0},
+    "ground": {"count": 0, "impulse": 0.0},
+}
+record_dir = args.record_dir.resolve() if args.record_dir else None
+record_rows = []
+rgb_annotator = None
+
+
+def capture_observation(frame, label, arm_target, gripper_target, robot, cube):
+    if rgb_annotator is None or frame % 30 != 0:
+        return
+
+    rep.orchestrator.step(rt_subframes=2, delta_time=0.0, pause_timeline=False)
+    image_name = f"rgb_{frame:06d}.png"
+    rgba = rgb_annotator.get_data()
+    Image.fromarray(rgba).convert("RGB").save(record_dir / image_name)
+
+    cube_position, cube_orientation = cube.get_world_pose()
+    record_rows.append(
+        {
+            "frame": frame,
+            "time_seconds": frame / 120.0,
+            "stage": label,
+            "image": image_name,
+            "action": {
+                "arm_joint_positions": np.asarray(arm_target).tolist(),
+                "gripper_joint_position": float(gripper_target),
+            },
+            "observation": {
+                "joint_positions": robot.get_joint_positions().tolist(),
+                "cube_position": cube_position.tolist(),
+                "cube_orientation_wxyz": cube_orientation.tolist(),
+            },
+        }
+    )
+
+
+def on_contact_report(contact_headers, contact_data):
+    for header in contact_headers:
+        actor_paths = (
+            str(PhysicsSchemaTools.intToSdfPath(header.actor0)),
+            str(PhysicsSchemaTools.intToSdfPath(header.actor1)),
+        )
+        if "/World/GraspCube" not in actor_paths:
+            continue
+
+        other_path = actor_paths[1] if actor_paths[0] == "/World/GraspCube" else actor_paths[0]
+        category = None
+        for name in contact_stats:
+            if name in other_path.lower():
+                category = name
+                break
+        if category is None:
+            continue
+
+        start = header.contact_data_offset
+        end = start + header.num_contact_data
+        contact_stats[category]["count"] += header.num_contact_data
+        contact_stats[category]["impulse"] += sum(
+            float(np.linalg.norm(contact_data[index].impulse))
+            for index in range(start, end)
+        )
 
 
 def blend(start, end, alpha):
@@ -56,7 +143,7 @@ def set_full_target(robot, arm_positions, gripper_position, dof_index):
     target = robot.get_joint_positions().copy()
     for index, value in enumerate(arm_positions):
         target[dof_index[f"joint{index + 1}"]] = value
-    for name in GRIPPER_JOINTS:
+    for name in GRIPPER_CONTROL_JOINTS:
         target[dof_index[name]] = gripper_position
     robot.get_articulation_controller().apply_action(
         ArticulationAction(joint_positions=target)
@@ -76,50 +163,81 @@ def solve_pose(solver, position):
     return np.asarray(action.joint_positions)
 
 
-def world_transform(stage, path):
-    cache = UsdGeom.XformCache()
-    return UsdGeom.Xformable(stage.GetPrimAtPath(path)).ComputeLocalToWorldTransform(cache.GetTime())
-
-
-def lock_cube_after_real_alignment(stage):
-    tcp_matrix = world_transform(stage, "/UF_ROBOT/root_joint/link_tcp")
-    left_matrix = world_transform(stage, "/UF_ROBOT/root_joint/left_finger")
-    right_matrix = world_transform(stage, "/UF_ROBOT/root_joint/right_finger")
-    cube_matrix = world_transform(stage, "/World/GraspCube")
-    cube_position = cube_matrix.ExtractTranslation()
-    tcp_distance = (tcp_matrix.ExtractTranslation() - cube_position).GetLength()
-    left_distance = (left_matrix.ExtractTranslation() - cube_position).GetLength()
-    right_distance = (right_matrix.ExtractTranslation() - cube_position).GetLength()
-    print(f"TCP-to-cube distance before lift: {tcp_distance:.4f} m", flush=True)
-    print(
-        f"Finger-link distances: left={left_distance:.4f} m right={right_distance:.4f} m",
-        flush=True,
+def world_bounds(stage, path):
+    cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [
+            UsdGeom.Tokens.default_,
+            UsdGeom.Tokens.render,
+            UsdGeom.Tokens.proxy,
+            UsdGeom.Tokens.guide,
+        ],
     )
-    if tcp_distance > 0.065:
-        raise RuntimeError("Grasp rejected: gripper never reached the cube")
+    bounds = cache.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedRange()
+    return np.asarray(bounds.GetMin()), np.asarray(bounds.GetMax())
 
-    gripper_path = Sdf.Path("/UF_ROBOT/root_joint/xarm_gripper_base_link")
-    cube_path = Sdf.Path("/World/GraspCube")
-    gripper_matrix = world_transform(stage, str(gripper_path))
-    # Gf matrices use row-vector convention, so the local transform is
-    # world_transform * parent_world_inverse.
-    relative = cube_matrix * gripper_matrix.GetInverse()
-    relative_position = relative.ExtractTranslation()
-    relative_rotation = relative.ExtractRotationQuat()
 
-    joint = UsdPhysics.FixedJoint.Define(stage, Sdf.Path("/World/grasp_lock"))
-    joint.CreateBody0Rel().SetTargets([gripper_path])
-    joint.CreateBody1Rel().SetTargets([cube_path])
-    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(relative_position))
-    joint.CreateLocalRot0Attr().Set(
-        Gf.Quatf(
-            float(relative_rotation.GetReal()),
-            Gf.Vec3f(relative_rotation.GetImaginary()),
-        )
-    )
-    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0))
-    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
-    print("Grasp lock enabled after alignment", flush=True)
+def axis_gap(first_min, first_max, second_min, second_max):
+    return np.maximum(0.0, np.maximum(first_min - second_max, second_min - first_max))
+
+
+def confirm_physical_grasp(stage, robot, dof_index):
+    cube_min, cube_max = world_bounds(stage, "/World/GraspCube")
+    left_min, left_max = world_bounds(stage, "/UF_ROBOT/root_joint/left_finger")
+    right_min, right_max = world_bounds(stage, "/UF_ROBOT/root_joint/right_finger")
+    left_gap = axis_gap(left_min, left_max, cube_min, cube_max)
+    right_gap = axis_gap(right_min, right_max, cube_min, cube_max)
+
+    print(f"Cube bounds: min={cube_min} max={cube_max}", flush=True)
+    print(f"Left finger bounds: min={left_min} max={left_max}", flush=True)
+    print(f"Right finger bounds: min={right_min} max={right_max}", flush=True)
+    print(f"Left finger gap xyz: {left_gap}", flush=True)
+    print(f"Right finger gap xyz: {right_gap}", flush=True)
+    joint_positions = robot.get_joint_positions()
+    actual_gripper = {
+        name: float(joint_positions[dof_index[name]]) for name in GRIPPER_JOINTS
+    }
+    print(f"Actual gripper joints: {actual_gripper}", flush=True)
+    print(f"Contact report: {contact_stats}", flush=True)
+
+    contact_tolerance = 0.006
+    if np.linalg.norm(left_gap) > contact_tolerance:
+        raise RuntimeError("Grasp rejected: left finger is not touching the cube")
+    if np.linalg.norm(right_gap) > contact_tolerance:
+        raise RuntimeError("Grasp rejected: right finger is not touching the cube")
+    print("Bilateral finger contact confirmed; lifting without an attachment joint", flush=True)
+
+
+def bind_finger_material(stage, physics_material):
+    for path in (
+        "/UF_ROBOT/root_joint/left_finger",
+        "/UF_ROBOT/root_joint/right_finger",
+    ):
+        finger = stage.GetPrimAtPath(path)
+        collision_group = stage.GetPrimAtPath(f"{path}/collisions")
+        if collision_group.IsInstance():
+            collision_group.SetInstanceable(False)
+        colliders = [
+            prim
+            for prim in Usd.PrimRange(finger)
+            if prim.HasAPI(UsdPhysics.CollisionAPI)
+        ]
+        if not colliders:
+            descendants = [
+                f"{prim.GetPath()} type={prim.GetTypeName()} "
+                f"schemas={list(prim.GetAppliedSchemas())}"
+                for prim in Usd.PrimRange(finger)
+            ]
+            print(f"No CollisionAPI prims below {path}: {descendants}", flush=True)
+            colliders = [finger]
+        for collider in colliders:
+            binding = UsdShade.MaterialBindingAPI.Apply(collider)
+            binding.Bind(
+                physics_material.material,
+                bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+                materialPurpose="physics",
+            )
+            print(f"Bound high-friction material to {collider.GetPath()}", flush=True)
 
 
 omni.usd.get_context().open_stage(str(ROBOT_USD))
@@ -135,10 +253,11 @@ world.scene.add_default_ground_plane(
 
 grip_material = PhysicsMaterial(
     prim_path="/World/HighFrictionMaterial",
-    static_friction=1.8,
-    dynamic_friction=1.5,
+    static_friction=3.0,
+    dynamic_friction=2.5,
     restitution=0.0,
 )
+bind_finger_material(omni.usd.get_context().get_stage(), grip_material)
 
 robot = world.scene.add(
     SingleArticulation(
@@ -151,10 +270,33 @@ cube = world.scene.add(
         prim_path="/World/GraspCube",
         name="grasp_cube",
         position=CUBE_POSITION,
-        scale=np.full(3, CUBE_SIZE),
+        size=CUBE_SIZE,
         color=np.array([0.85, 0.12, 0.08]),
         physics_material=grip_material,
         mass=0.05,
+    )
+)
+if record_dir:
+    record_dir.mkdir(parents=True, exist_ok=True)
+    carb.settings.get_settings().set("/omni/replicator/captureOnPlay", False)
+    camera = rep.create.camera(
+        position=(1.15, 1.15, 0.82),
+        look_at=(0.25, 0.0, 0.22),
+    )
+    rep.create.light(rotation=(315, 0, 0), intensity=2500, light_type="distant")
+    rep.create.light(intensity=500, light_type="dome")
+    render_product = rep.create.render_product(camera, (256, 256))
+    rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+    rgb_annotator.attach(render_product)
+    rep.orchestrator.preview()
+
+contact_report = PhysxSchema.PhysxContactReportAPI.Apply(
+    omni.usd.get_context().get_stage().GetPrimAtPath("/World/GraspCube")
+)
+contact_report.CreateThresholdAttr().Set(0.0)
+contact_subscription = (
+    omni.physx.get_physx_simulation_interface().subscribe_contact_report_events(
+        on_contact_report
     )
 )
 
@@ -181,7 +323,7 @@ for name in [f"joint{i}" for i in range(1, 7)]:
     kds[index] = 500.0
     max_efforts[index] = 150.0
 
-for name in GRIPPER_JOINTS:
+for name in GRIPPER_CONTROL_JOINTS:
     index = dof_index[name]
     kps[index] = 12000.0
     kds[index] = 800.0
@@ -192,16 +334,17 @@ controller.set_max_efforts(max_efforts)
 
 lula = LulaKinematicsSolver(
     robot_description_path=str(ROOT / "config/xarm6_robot_descriptor.yaml"),
-    urdf_path=str(ROOT / "assets/xarm6_gripper/xarm6_gripper.urdf"),
+    urdf_path=str(ROOT / "assets/xarm6_gripper/xarm6_gripper_control.urdf"),
 )
 ik_solver = ArticulationKinematicsSolver(robot, lula, "link_tcp")
 
-approach = solve_pose(ik_solver, [CUBE_POSITION[0], CUBE_POSITION[1], 0.22])
-grasp = solve_pose(ik_solver, [CUBE_POSITION[0], CUBE_POSITION[1], 0.07])
-lift = solve_pose(ik_solver, [CUBE_POSITION[0], CUBE_POSITION[1], 0.30])
+grasp_xy = CUBE_POSITION[:2] + GRASP_CENTER_OFFSET[:2]
+approach = solve_pose(ik_solver, [grasp_xy[0], grasp_xy[1], 0.22])
+grasp = solve_pose(ik_solver, [grasp_xy[0], grasp_xy[1], 0.020])
+lift = solve_pose(ik_solver, [grasp_xy[0], grasp_xy[1], 0.30])
 
 start = robot.get_joint_positions()[:6].copy()
-set_full_target(robot, start, 0.85, dof_index)
+set_full_target(robot, start, 0.0, dof_index)
 
 if not args.headless:
     set_camera_view(
@@ -214,32 +357,81 @@ timeline = omni.timeline.get_timeline_interface()
 timeline.play()
 
 stages = [
-    (start, approach, 120, 0.85, "move above cube"),
-    (approach, grasp, 120, 0.85, "descend"),
-    (grasp, grasp, 110, 0.05, "close gripper"),
-    (grasp, grasp, 50, 0.05, "confirm grasp"),
-    (grasp, lift, 160, 0.05, "lift"),
+    (start, approach, 120, 0.0, "move above cube"),
+    (approach, grasp, 120, 0.0, "descend"),
+    (grasp, grasp, 180, 0.70, "close gripper"),
+    (grasp, grasp, 80, 0.70, "confirm grasp"),
+    (grasp, lift, 240, 0.70, "lift"),
 ]
 
 frame = 0
-lock_created = False
+grasp_confirmed = False
+max_cube_z = float(CUBE_POSITION[2])
 for arm_start, arm_end, duration, gripper_target, label in stages:
     print(label, flush=True)
+    if label == "lift":
+        for stats in contact_stats.values():
+            stats["count"] = 0
+            stats["impulse"] = 0.0
     for local_frame in range(duration):
         arm_target = blend(arm_start, arm_end, local_frame / max(duration - 1, 1))
         set_full_target(robot, arm_target, gripper_target, dof_index)
 
-        if label == "confirm grasp" and local_frame == duration - 5 and not lock_created:
-            lock_cube_after_real_alignment(omni.usd.get_context().get_stage())
-            lock_created = True
+        if label == "confirm grasp" and local_frame == duration - 5 and not grasp_confirmed:
+            confirm_physical_grasp(
+                omni.usd.get_context().get_stage(), robot, dof_index
+            )
+            grasp_confirmed = True
 
         world.step(render=not args.headless)
+        capture_observation(
+            frame,
+            label,
+            arm_target,
+            gripper_target,
+            robot,
+            cube,
+        )
+        if label == "lift":
+            current_cube_position, _ = cube.get_world_pose()
+            max_cube_z = max(max_cube_z, float(current_cube_position[2]))
         frame += 1
 
 timeline.stop()
 cube_position, _ = cube.get_world_pose()
 print(f"Final cube position: {cube_position}", flush=True)
+print(f"Maximum cube height during lift: {max_cube_z}", flush=True)
+print(f"Lift contact report: {contact_stats}", flush=True)
+for side in ("left_finger", "right_finger"):
+    finger_min, finger_max = world_bounds(
+        omni.usd.get_context().get_stage(), f"/UF_ROBOT/root_joint/{side}"
+    )
+    print(f"Final {side} bounds: min={finger_min} max={finger_max}", flush=True)
+if cube_position[2] < 0.10:
+    raise RuntimeError("Grasp failed: cube did not leave the ground")
 print("Demo finished", flush=True)
+
+if record_dir:
+    with (record_dir / "actions.jsonl").open("w", encoding="utf-8") as stream:
+        for row in record_rows:
+            stream.write(json.dumps(row, ensure_ascii=True) + "\n")
+    metadata = {
+        "random_seed": args.random_seed,
+        "capture_fps": 4,
+        "physics_fps": 120,
+        "resolution": [256, 256],
+        "cube_size_m": CUBE_SIZE,
+        "cube_initial_position": CUBE_POSITION.tolist(),
+        "cube_final_position": cube_position.tolist(),
+        "success": True,
+        "frames_written": len(record_rows),
+    }
+    (record_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+    rep.orchestrator.wait_until_complete()
+    print(f"Recorded episode to {record_dir}", flush=True)
 
 if args.headless:
     app.close()

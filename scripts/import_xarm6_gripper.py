@@ -1,12 +1,31 @@
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 from isaacsim import SimulationApp
 
 
 ROOT = Path(__file__).resolve().parents[1]
-URDF_PATH = ROOT / "assets" / "xarm6_gripper" / "xarm6_gripper.urdf"
+SOURCE_URDF_PATH = ROOT / "assets" / "xarm6_gripper" / "xarm6_gripper.urdf"
+URDF_PATH = ROOT / "assets" / "xarm6_gripper" / "xarm6_gripper_control.urdf"
 USD_PATH = ROOT / "assets" / "xarm6_gripper" / "xarm6_gripper.usd"
 
+
+def create_control_urdf():
+    tree = ET.parse(SOURCE_URDF_PATH)
+    robot = tree.getroot()
+
+    # Isaac Sim controls each imported joint directly. Removing the mimic tags
+    # avoids the importer applying the gripper relationship a second time.
+    for joint in robot.findall("joint"):
+        mimic = joint.find("mimic")
+        if mimic is not None:
+            joint.remove(mimic)
+
+    ET.indent(tree, space="  ")
+    tree.write(URDF_PATH, encoding="utf-8", xml_declaration=True)
+
+
+create_control_urdf()
 app = SimulationApp({"headless": True})
 
 import omni.kit.commands
@@ -18,6 +37,8 @@ if not status:
     raise RuntimeError("Could not create URDF import configuration")
 
 config.merge_fixed_joints = False
+# A single convex hull keeps each finger's inner contact face continuous.
+# Convex decomposition left gaps in the imported fingertip collision surface.
 config.convex_decomp = False
 config.import_inertia_tensor = True
 config.fix_base = True

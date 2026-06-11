@@ -26,3 +26,23 @@ https://github.com/xArm-Developer/xarm_ros2
 
 The generated URDF excludes ROS 2 control, Gazebo, and transmission elements
 that are not required by Isaac Sim's URDF importer.
+
+## Physical Grasp Demo
+
+Rebuild the combined arm and gripper USD:
+
+```powershell
+& C:\Users\User\isaac_sim_5.1\python.bat scripts\import_xarm6_gripper.py
+```
+
+Run the physical grasp demo:
+
+```powershell
+& C:\Users\User\isaac_sim_5.1\python.bat scripts\grasp_cube_demo.py
+```
+
+The demo uses real PhysX finger contacts and fails if the cube does not leave
+the ground. It does not create an attachment or fixed joint.
+
+See `docs/weekly_report_42_plan.md` for randomized episode recording, dataset
+validation, and RLDS-shaped export commands.

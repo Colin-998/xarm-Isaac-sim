@@ -4,3 +4,6 @@
 /assets/xarm6/usd/
 /*.log
 /ik_results.txt
+/outputs/
+__pycache__/
+*.pyc
