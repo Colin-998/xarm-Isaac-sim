@@ -82,6 +82,7 @@ DOWNWARD = np.array([0.0, 1.0, 0.0, 0.0])
 OPEN_GRIPPER = 0.0
 CLOSED_GRIPPER = 0.70
 OBSTACLE_CLEARANCE = 0.012
+SELF_CLEARANCE = 0.020
 GRIPPER_JOINTS = [
     "drive_joint",
     "left_inner_knuckle_joint",
@@ -325,17 +326,24 @@ def blend(start, end, alpha):
 def choose_teacher_detour(obstacles, safe_height):
     """Route through the negative-X corridor, opposite the obstacle field."""
     del obstacles
-    return np.array([-0.24, 0.0, safe_height])
+    return np.array([-0.24, -0.32, safe_height])
 
 
 def obstacle_safe_height(obstacles):
     del obstacles
     # The route stays in the negative-X corridor, away from the positive-X
     # obstacle field. This height is reachable without switching IK branches.
-    return 0.44
+    return 0.34
 
 
 def collision_prims(root_prim):
+    rigid_bodies = [
+        prim
+        for prim in Usd.PrimRange(root_prim)
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI)
+    ]
+    if rigid_bodies:
+        return rigid_bodies
     return [
         prim
         for prim in Usd.PrimRange(root_prim)
@@ -345,7 +353,16 @@ def collision_prims(root_prim):
 
 def world_aabb(cache, prim):
     bounds = cache.ComputeWorldBound(prim).ComputeAlignedBox()
-    return np.asarray(bounds.GetMin()), np.asarray(bounds.GetMax())
+    minimum = np.asarray(bounds.GetMin())
+    maximum = np.asarray(bounds.GetMax())
+    if (
+        not np.all(np.isfinite(minimum))
+        or not np.all(np.isfinite(maximum))
+        or np.any(maximum < minimum)
+        or np.max(np.abs(np.concatenate([minimum, maximum]))) > 1e6
+    ):
+        raise RuntimeError(f"Invalid world bounds for {prim.GetPath()}")
+    return minimum, maximum
 
 
 def aabb_distance(first, second):
@@ -358,7 +375,7 @@ def aabb_distance(first, second):
     return float(np.linalg.norm(gap))
 
 
-def assert_robot_obstacle_clearance(stage, robot_colliders, obstacles, phase):
+def robot_obstacle_clearance(stage, robot_colliders, obstacles):
     cache = UsdGeom.BBoxCache(
         Usd.TimeCode.Default(),
         [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
@@ -368,24 +385,99 @@ def assert_robot_obstacle_clearance(stage, robot_colliders, obstacles, phase):
         stage.GetPrimAtPath(obstacle.prim_path)
         for obstacle in obstacles
     ]
+    closest = (float("inf"), None, None)
+    valid_robot_bounds = 0
     for robot_prim in robot_colliders:
-        robot_bounds = world_aabb(cache, robot_prim)
+        try:
+            robot_bounds = world_aabb(cache, robot_prim)
+        except RuntimeError:
+            continue
+        valid_robot_bounds += 1
         for obstacle_prim in obstacle_prims:
             distance = aabb_distance(
                 robot_bounds,
                 world_aabb(cache, obstacle_prim),
             )
-            if distance < OBSTACLE_CLEARANCE:
-                raise RuntimeError(
-                    "Robot entered the obstacle safety envelope: "
-                    f"phase={phase}, link={robot_prim.GetPath()}, "
-                    f"obstacle={obstacle_prim.GetPath()}, "
-                    f"clearance={distance:.4f}m, "
-                    f"required={OBSTACLE_CLEARANCE:.4f}m"
-                )
+            if distance < closest[0]:
+                closest = (distance, robot_prim, obstacle_prim)
+    if valid_robot_bounds == 0 or closest[1] is None:
+        raise RuntimeError("No valid robot link bounds were available")
+    return closest
 
 
-def assert_gripper_above_ground(stage, finger_collider_paths):
+def assert_robot_obstacle_clearance(stage, robot_colliders, obstacles, phase):
+    distance, robot_prim, obstacle_prim = robot_obstacle_clearance(
+        stage,
+        robot_colliders,
+        obstacles,
+    )
+    if distance < OBSTACLE_CLEARANCE:
+        raise RuntimeError(
+            "Robot entered the obstacle safety envelope: "
+            f"phase={phase}, link={robot_prim.GetPath()}, "
+            f"obstacle={obstacle_prim.GetPath()}, "
+            f"clearance={distance:.4f}m, "
+            f"required={OBSTACLE_CLEARANCE:.4f}m"
+        )
+    return distance
+
+
+def arm_self_clearance(stage):
+    cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+        useExtentsHint=False,
+    )
+    chain_names = [
+        "link_base",
+        "link1",
+        "link2",
+        "link3",
+        "link4",
+        "link5",
+        "link6",
+        "xarm_gripper_base_link",
+    ]
+    chain = []
+    for index, name in enumerate(chain_names):
+        prim = stage.GetPrimAtPath(f"/UF_ROBOT/root_joint/{name}")
+        if not prim.IsValid():
+            continue
+        try:
+            bounds = world_aabb(cache, prim)
+        except RuntimeError:
+            continue
+        chain.append((index, prim, bounds))
+
+    closest = (float("inf"), None, None)
+    for first_index, first_prim, first_bounds in chain:
+        for second_index, second_prim, second_bounds in chain:
+            # Adjacent links and links separated by one compact wrist joint
+            # naturally have overlapping AABBs on this robot.
+            if first_index > 2 or second_index - first_index < 3:
+                continue
+            distance = aabb_distance(first_bounds, second_bounds)
+            if distance < closest[0]:
+                closest = (distance, first_prim, second_prim)
+    if closest[1] is None:
+        raise RuntimeError("No valid non-adjacent robot link pairs were available")
+    return closest
+
+
+def assert_arm_self_clearance(stage, phase):
+    distance, first_prim, second_prim = arm_self_clearance(stage)
+    if distance < SELF_CLEARANCE:
+        raise RuntimeError(
+            "Robot links entered the self-collision safety envelope: "
+            f"phase={phase}, first={first_prim.GetPath()}, "
+            f"second={second_prim.GetPath()}, "
+            f"clearance={distance:.4f}m, "
+            f"required={SELF_CLEARANCE:.4f}m"
+        )
+    return distance
+
+
+def assert_gripper_above_ground(stage):
     cache = UsdGeom.BBoxCache(
         Usd.TimeCode.Default(),
         [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
@@ -393,7 +485,10 @@ def assert_gripper_above_ground(stage, finger_collider_paths):
     )
     minimum_z = min(
         world_aabb(cache, stage.GetPrimAtPath(path))[0][2]
-        for path in finger_collider_paths
+        for path in (
+            "/UF_ROBOT/root_joint/left_finger",
+            "/UF_ROBOT/root_joint/right_finger",
+        )
     )
     if minimum_z < 0.005:
         raise RuntimeError(
@@ -598,7 +693,10 @@ lula = LulaKinematicsSolver(
     urdf_path=str(ROOT / "assets/xarm6_gripper/xarm6_gripper_control.urdf"),
 )
 ik_solver = ArticulationKinematicsSolver(robot, lula, "link_tcp")
-safe_home = solve_pose(ik_solver, np.array([0.12, 0.0, 0.50]))
+safe_home = solve_pose(
+    ik_solver,
+    arc_position(BELT_END_ANGLE, BELT_HEIGHT + 0.24),
+)
 stage = omni.usd.get_context().get_stage()
 robot_colliders = collision_prims(
     stage.GetPrimAtPath("/UF_ROBOT/root_joint")
@@ -680,13 +778,14 @@ while app.is_running():
     set_conveyor_speed(conveyor_graph_nodes, 0.0)
     for _ in range(10):
         world.step(render=not args.headless)
-    assert_robot_obstacle_clearance(
+    minimum_robot_clearance = assert_robot_obstacle_clearance(
         stage,
         robot_colliders,
         obstacles,
         "safe_home",
     )
-    assert_gripper_above_ground(stage, bound_colliders)
+    minimum_self_clearance = assert_arm_self_clearance(stage, "safe_home")
+    assert_gripper_above_ground(stage)
     verify_conveyor_segments_fixed(
         conveyor_segments,
         conveyor_expected_positions,
@@ -726,8 +825,7 @@ while app.is_running():
     start_place = solve_pose(ik_solver, conveyor_start)
 
     stages = [
-        (safe_home, end_lift, 160, OPEN_GRIPPER, "safe_approach"),
-        (end_lift, end_above, 100, OPEN_GRIPPER, "approach_end"),
+        (safe_home, end_above, 180, OPEN_GRIPPER, "safe_approach"),
         (end_above, end_grasp, 100, OPEN_GRIPPER, "descend_end"),
         (end_grasp, end_grasp, 140, CLOSED_GRIPPER, "grasp_at_end"),
         (end_grasp, end_lift, 140, CLOSED_GRIPPER, "lift_from_end"),
@@ -758,18 +856,32 @@ while app.is_running():
                 local_frame / max(duration - 1, 1),
             )
             set_target(robot, arm_target, gripper, dof_index)
-            assert_robot_obstacle_clearance(
-                stage,
-                robot_colliders,
-                obstacles,
-                phase,
+            minimum_robot_clearance = min(
+                minimum_robot_clearance,
+                assert_robot_obstacle_clearance(
+                    stage,
+                    robot_colliders,
+                    obstacles,
+                    phase,
+                ),
+            )
+            minimum_self_clearance = min(
+                minimum_self_clearance,
+                assert_arm_self_clearance(stage, phase),
             )
             world.step(render=not args.headless)
-            assert_robot_obstacle_clearance(
-                stage,
-                robot_colliders,
-                obstacles,
-                phase,
+            minimum_robot_clearance = min(
+                minimum_robot_clearance,
+                assert_robot_obstacle_clearance(
+                    stage,
+                    robot_colliders,
+                    obstacles,
+                    phase,
+                ),
+            )
+            minimum_self_clearance = min(
+                minimum_self_clearance,
+                assert_arm_self_clearance(stage, phase),
             )
             max_cube_height = max(
                 max_cube_height,
@@ -823,11 +935,18 @@ while app.is_running():
     while conveyor_return_frames < max_return_frames:
         set_target(robot, safe_home, OPEN_GRIPPER, dof_index)
         world.step(render=not args.headless)
-        assert_robot_obstacle_clearance(
-            stage,
-            robot_colliders,
-            obstacles,
-            "conveyor_return",
+        minimum_robot_clearance = min(
+            minimum_robot_clearance,
+            assert_robot_obstacle_clearance(
+                stage,
+                robot_colliders,
+                obstacles,
+                "conveyor_return",
+            ),
+        )
+        minimum_self_clearance = min(
+            minimum_self_clearance,
+            assert_arm_self_clearance(stage, "conveyor_return"),
         )
         cube_position = np.asarray(cube.get_world_pose()[0])
         max_cube_height = max(max_cube_height, float(cube_position[2]))
@@ -883,6 +1002,10 @@ while app.is_running():
         "conveyor_return_seconds": conveyor_return_frames / PHYSICS_FPS,
         "max_cube_height_m": max_cube_height,
         "final_end_distance_m": final_end_distance,
+        "minimum_robot_obstacle_clearance_m": minimum_robot_clearance,
+        "required_robot_obstacle_clearance_m": OBSTACLE_CLEARANCE,
+        "minimum_arm_self_clearance_m": minimum_self_clearance,
+        "required_arm_self_clearance_m": SELF_CLEARANCE,
     }
     if not lifted or not returned_and_stopped:
         raise RuntimeError(
