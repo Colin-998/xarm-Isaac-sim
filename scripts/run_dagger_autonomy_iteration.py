@@ -70,7 +70,7 @@ def parse_args():
     parser.add_argument("--terminal-servo-align-frames", type=int, default=900)
     parser.add_argument(
         "--terminal-servo-phases",
-        default="descend_to_cube,close_gripper",
+        default="close_gripper",
         help=(
             "Comma-separated phases where the no-vision terminal servo is allowed. "
             "The default keeps the calibrated finger-pocket grasp aligned "
@@ -345,7 +345,7 @@ def main():
         if args.show_isaac:
             command[2:2] = ["--episodes", str(max(1, cycles))]
         else:
-            command[2:2] = ["--headless", "--cycles", str(max(1, cycles))]
+            command[2:2] = ["--headless", "--episodes", str(max(1, cycles))]
         if not args.no_static_plan:
             command.insert(2, "--use-static-plan")
         if args.allow_phase_mismatch:

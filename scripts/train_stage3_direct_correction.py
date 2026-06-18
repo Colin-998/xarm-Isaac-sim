@@ -387,6 +387,9 @@ def evaluate(
         "accuracy": 0.0,
         "key_action": 0.0,
         "close_action": 0.0,
+        "expert_action_mae": 0.0,
+        "expert_final_arm_mae_rad": 0.0,
+        "expert_final_gripper_mae": 0.0,
     }
     count = 0
     key_count = 0
@@ -410,6 +413,9 @@ def evaluate(
                 action_target,
                 reduction="none",
             ).mean(dim=1)
+            action_abs = torch.abs(action_pred - action_target)
+            final_arm_abs = action_abs[:, -7:-1].mean(dim=1)
+            final_gripper_abs = action_abs[:, -1]
             sample_weights = 1.0 + action_loss_weight * key_phase
             action_loss = (per_action * sample_weights).mean()
             phase_loss = F.cross_entropy(phase_logits, phase_id)
@@ -421,6 +427,9 @@ def evaluate(
             totals["action"] += float(per_action.mean().detach().cpu()) * batch_count
             totals["phase"] += float(phase_loss.detach().cpu()) * batch_count
             totals["accuracy"] += float((pred == phase_id).float().mean().detach().cpu()) * batch_count
+            totals["expert_action_mae"] += float(action_abs.mean(dim=1).sum().detach().cpu())
+            totals["expert_final_arm_mae_rad"] += float(final_arm_abs.sum().detach().cpu())
+            totals["expert_final_gripper_mae"] += float(final_gripper_abs.sum().detach().cpu())
             key_mask = key_phase > 0.5
             if key_mask.any():
                 key_count += int(key_mask.sum().item())
@@ -436,6 +445,9 @@ def evaluate(
         "accuracy": totals["accuracy"] / max(1, count),
         "key_action": totals["key_action"] / max(1, key_count),
         "close_action": totals["close_action"] / max(1, close_count),
+        "expert_action_mae": totals["expert_action_mae"] / max(1, count),
+        "expert_final_arm_mae_rad": totals["expert_final_arm_mae_rad"] / max(1, count),
+        "expert_final_gripper_mae": totals["expert_final_gripper_mae"] / max(1, count),
         "samples": count,
         "key_samples": key_count,
         "close_samples": close_count,
@@ -594,6 +606,7 @@ def main():
     )
     metrics_path = args.output_dir / "metrics.jsonl"
     total_steps = 0
+    best_expert_action = None
     with metrics_path.open("w", encoding="utf-8") as metrics_stream:
         for epoch in range(args.epochs):
             model.train()
@@ -665,11 +678,23 @@ def main():
                 "state_std": state_std.tolist(),
             }
             torch.save(checkpoint, args.output_dir / "latest_stage3_policy.pt")
+            if (
+                best_expert_action is None
+                or row["expert_action_mae"] < best_expert_action
+            ):
+                best_expert_action = row["expert_action_mae"]
+                torch.save(checkpoint, args.output_dir / "best_stage3_policy.pt")
+                (args.output_dir / "best_metrics.json").write_text(
+                    json.dumps(row, indent=2),
+                    encoding="utf-8",
+                )
             print(
                 f"saved_direct_correction epoch={epoch + 1} "
                 f"checkpoint={args.output_dir / 'latest_stage3_policy.pt'} "
                 f"val_action={row['action']:.4f} "
-                f"val_close_action={row['close_action']:.4f}",
+                f"val_close_action={row['close_action']:.4f} "
+                f"expert_mae={row['expert_action_mae']:.4f} "
+                f"expert_arm_rad={row['expert_final_arm_mae_rad']:.4f}",
                 flush=True,
             )
 

@@ -125,7 +125,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--brain-terminal-servo-phases",
-    default="descend_to_cube,close_gripper",
+    default="close_gripper",
     help="Comma-separated phases where terminal cube servo is allowed.",
 )
 parser.add_argument(
@@ -149,8 +149,50 @@ parser.add_argument(
 parser.add_argument(
     "--brain-terminal-servo-z-offset",
     type=float,
-    default=0.0,
+    default=0.010,
     help="Vertical TCP offset relative to the detected cube center.",
+)
+parser.add_argument(
+    "--disable-vertical-grasp-servo",
+    action="store_true",
+    help=(
+        "Disable the safe final grasp servo that aligns XY above the cube "
+        "before descending vertically."
+    ),
+)
+parser.add_argument(
+    "--vertical-grasp-hover-height",
+    type=float,
+    default=0.075,
+    help="Height above the cube used before the final vertical grasp descent.",
+)
+parser.add_argument(
+    "--vertical-grasp-xy-tolerance",
+    type=float,
+    default=0.010,
+    help="XY tolerance required before the final grasp servo descends.",
+)
+parser.add_argument(
+    "--vertical-grasp-steps",
+    type=int,
+    default=8,
+    help="Number of Cartesian waypoints used for the final vertical descent.",
+)
+parser.add_argument(
+    "--vertical-grasp-frames-per-step",
+    type=int,
+    default=8,
+    help="Simulation frames used for each vertical grasp waypoint.",
+)
+parser.add_argument(
+    "--grasp-outward-offset",
+    type=float,
+    default=0.015,
+    help=(
+        "Move the final grasp center this many meters outward from the robot "
+        "base, so the fingers approach the cube from slightly outside instead "
+        "of pressing into its inner face."
+    ),
 )
 parser.add_argument(
     "--grasp-cube-tcp-local-offset",
@@ -217,6 +259,11 @@ parser.add_argument(
     default=Path("outputs/vjepa2_brain_live_run.json"),
 )
 parser.add_argument(
+    "--ui-smoke-test",
+    action="store_true",
+    help="Exercise Run Again, End, and language command handlers, then exit.",
+)
+parser.add_argument(
     "--grasp-mode",
     choices=["relative", "teleport", "physics"],
     default="relative",
@@ -234,6 +281,59 @@ parser.add_argument(
         "Maximum TCP-to-cube distance allowed before the relative payload "
         "attachment is accepted. Keep this tight so the demo does not look "
         "like a remote grasp."
+    ),
+)
+parser.add_argument(
+    "--disable-link-clearance-monitor",
+    action="store_true",
+    help="Disable runtime robot-link to obstacle clearance checks.",
+)
+parser.add_argument(
+    "--link-clearance-threshold",
+    type=float,
+    default=0.012,
+    help="Minimum allowed robot-link surface clearance to obstacles in meters.",
+)
+parser.add_argument(
+    "--link-clearance-radius",
+    type=float,
+    default=0.035,
+    help="Conservative capsule radius used for monitored robot links.",
+)
+parser.add_argument(
+    "--link-clearance-action",
+    choices=["stop", "warn"],
+    default="stop",
+    help="Stop the cycle or only warn when a link clearance violation occurs.",
+)
+parser.add_argument(
+    "--cube-clearance-threshold",
+    type=float,
+    default=0.004,
+    help=(
+        "Minimum allowed robot-to-cube clearance outside the real grasp "
+        "phases. This prevents approach motions from pushing the cube."
+    ),
+)
+parser.add_argument(
+    "--cube-clearance-radius",
+    type=float,
+    default=0.020,
+    help="Conservative radius used for robot points in cube clearance checks.",
+)
+parser.add_argument(
+    "--cube-contact-allowed-phases",
+    default="vertical_grasp,close_gripper,lift_cube,open_gripper",
+    help="Comma-separated phases where close contact with the cube is expected.",
+)
+parser.add_argument(
+    "--release-cube-clearance-grace-frames",
+    type=int,
+    default=45,
+    help=(
+        "Frames after releasing the cube where cube clearance checks are "
+        "temporarily skipped so the gripper can retreat before monitoring "
+        "resumes."
     ),
 )
 args, _ = parser.parse_known_args()
@@ -280,6 +380,23 @@ GRIPPER_JOINTS = [
     "left_finger_joint",
     "right_finger_joint",
 ]
+MONITORED_LINK_NAMES = [
+    "link1",
+    "link2",
+    "link3",
+    "link4",
+    "link5",
+    "link6",
+    "link_eef",
+    "xarm_gripper_base_link",
+    "left_outer_knuckle",
+    "left_finger",
+    "left_inner_knuckle",
+    "right_outer_knuckle",
+    "right_finger",
+    "right_inner_knuckle",
+    "link_tcp",
+]
 
 app = SimulationApp(
     {
@@ -298,7 +415,7 @@ import omni.timeline
 import omni.ui as ui
 import omni.usd
 from PIL import Image
-from pxr import Gf, PhysxSchema, Usd, UsdPhysics, UsdShade
+from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics, UsdShade
 from isaacsim.core.api import World
 from isaacsim.core.api.materials import PhysicsMaterial
 from isaacsim.core.api.objects import DynamicCuboid, FixedCuboid
@@ -804,17 +921,27 @@ world.scene.add(
 )
 conveyor_segments, conveyor_graph_nodes = create_arc_conveyor(world)
 obstacle_objects = []
+obstacle_bounds = []
 for index, obstacle in enumerate(metadata["obstacles"]):
+    obstacle_position = np.asarray(obstacle["position"], dtype=float)
+    obstacle_dims = np.asarray(
+        obstacle.get("dims", obstacle.get("scale")),
+        dtype=float,
+    )
+    obstacle_bounds.append(
+        {
+            "name": obstacle.get("name", f"obstacle_{index}"),
+            "center": obstacle_position,
+            "half": obstacle_dims / 2.0,
+        }
+    )
     obstacle_objects.append(
         world.scene.add(
         FixedCuboid(
             prim_path=f"/World/Obstacles/Obstacle_{index}",
             name=f"obstacle_{index}",
-            position=np.asarray(obstacle["position"], dtype=float),
-            scale=np.asarray(
-                obstacle.get("dims", obstacle.get("scale")),
-                dtype=float,
-            ),
+            position=obstacle_position,
+            scale=obstacle_dims,
             color=np.array([0.95, 0.55 - index * 0.15, 0.05]),
         )
         )
@@ -1101,10 +1228,108 @@ def should_render_world():
 
 timeline = omni.timeline.get_timeline_interface()
 timeline.play()
-control_state = {"retry_requested": False, "end_requested": False}
+control_state = {
+    "retry_requested": False,
+    "end_requested": False,
+    "last_command": "",
+}
 status_label = None
+command_field = None
+command_feedback_label = None
+
+
+def set_command_feedback(message):
+    print(f"ui_command {message}", flush=True)
+    if command_feedback_label is not None:
+        command_feedback_label.text = message
+
+
+def request_retry(source="button"):
+    control_state["retry_requested"] = True
+    control_state["last_command"] = source
+    set_command_feedback(f"Run Again requested by {source}")
+
+
+def request_end(source="button"):
+    control_state["end_requested"] = True
+    control_state["last_command"] = source
+    set_command_feedback(f"End requested by {source}")
+
+
+def handle_language_command(command_text):
+    normalized = command_text.strip().lower()
+    if not normalized:
+        set_command_feedback("Type: run again, end, or status")
+        return
+    if any(
+        phrase in normalized
+        for phrase in {
+            "run again",
+            "retry",
+            "restart",
+            "reset",
+            "重新",
+            "再跑",
+            "重跑",
+            "重新測試",
+        }
+    ):
+        request_retry("language")
+        return
+    if any(
+        phrase in normalized
+        for phrase in {"end", "stop", "quit", "exit", "結束", "停止", "關閉"}
+    ):
+        request_end("language")
+        return
+    if any(phrase in normalized for phrase in {"status", "狀態", "進度"}):
+        message = (
+            f"Status: brain={args.brain_control}, "
+            f"retry={control_state['retry_requested']}, "
+            f"end={control_state['end_requested']}"
+        )
+        set_command_feedback(message)
+        if status_label is not None:
+            status_label.text = message
+        return
+    if any(phrase in normalized for phrase in {"help", "指令", "幫助"}):
+        set_command_feedback("Commands: run again / end / status")
+        return
+    set_command_feedback(f"Unknown command: {command_text}")
+
+
+def submit_language_command():
+    if command_field is None:
+        return
+    command_text = command_field.model.get_value_as_string()
+    handle_language_command(command_text)
+    command_field.model.set_value("")
+
+
+def run_ui_smoke_test():
+    handle_language_command("status")
+    if control_state["retry_requested"] or control_state["end_requested"]:
+        raise RuntimeError("status command changed control flags")
+    request_retry("ui_smoke_test")
+    if not control_state["retry_requested"]:
+        raise RuntimeError("Run Again handler did not set retry_requested")
+    control_state["retry_requested"] = False
+    handle_language_command("run again")
+    if not control_state["retry_requested"]:
+        raise RuntimeError("language run again did not set retry_requested")
+    control_state["retry_requested"] = False
+    request_end("ui_smoke_test")
+    if not control_state["end_requested"]:
+        raise RuntimeError("End handler did not set end_requested")
+    control_state["end_requested"] = False
+    handle_language_command("end")
+    if not control_state["end_requested"]:
+        raise RuntimeError("language end did not set end_requested")
+    print("ui_smoke_test_passed", flush=True)
+
+
 if not args.headless:
-    window = ui.Window("cuRobo Conveyor Cycle", width=340, height=135)
+    window = ui.Window("cuRobo Conveyor Cycle", width=420, height=210)
     with window.frame:
         with ui.VStack(spacing=8):
             status_label = ui.Label("Starting...")
@@ -1112,17 +1337,23 @@ if not args.headless:
                 ui.Button(
                     "Run Again",
                     height=38,
-                    clicked_fn=lambda: control_state.update(
-                        retry_requested=True
-                    ),
+                    clicked_fn=lambda: request_retry("button"),
                 )
                 ui.Button(
                     "End",
                     height=38,
-                    clicked_fn=lambda: control_state.update(
-                        end_requested=True
-                    ),
+                    clicked_fn=lambda: request_end("button"),
                 )
+            ui.Label("Command")
+            with ui.HStack(spacing=8):
+                command_field = ui.StringField(height=32)
+                ui.Button("Send", width=80, height=32, clicked_fn=submit_language_command)
+            command_feedback_label = ui.Label("Commands: run again / end / status")
+
+if args.ui_smoke_test:
+    run_ui_smoke_test()
+    app.close()
+    raise SystemExit(0)
 
 
 payload_state = {
@@ -1133,6 +1364,25 @@ payload_state = {
     "max_cube_height_m": float(cube_initial_position[2]),
     "teleport_shortcut_used": False,
     "last_failure": None,
+    "release_clearance_grace_frames": 0,
+}
+clearance_state = {
+    "enabled": not args.disable_link_clearance_monitor,
+    "threshold_m": float(args.link_clearance_threshold),
+    "link_radius_m": float(args.link_clearance_radius),
+    "cube_threshold_m": float(args.cube_clearance_threshold),
+    "cube_radius_m": float(args.cube_clearance_radius),
+    "cube_contact_allowed_phases": [
+        phase.strip()
+        for phase in str(args.cube_contact_allowed_phases).split(",")
+        if phase.strip()
+    ],
+    "action": args.link_clearance_action,
+    "monitored_links": [],
+    "min_clearance_m": None,
+    "min_cube_clearance_m": None,
+    "last_violation": None,
+    "violations": [],
 }
 recording_state = {"recorder": None}
 live_run_state = {"cycles": [], "failures": []}
@@ -1211,6 +1461,7 @@ def write_brain_run_report():
         "brain_runtime": brain_runtime.summary(),
         "terminal_servo": terminal_servo_state,
         "place_servo": place_servo_state,
+        "link_clearance": clearance_state,
     }
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
@@ -1243,6 +1494,13 @@ def record_brain_failure(cycle_number, error):
         "grasp_attach_distance_m": payload_state["attach_distance_m"],
         "max_cube_height_m": float(payload_state["max_cube_height_m"]),
         "teleport_shortcut_used": payload_state["teleport_shortcut_used"],
+        "minimum_robot_obstacle_clearance_m": clearance_state[
+            "min_clearance_m"
+        ],
+        "minimum_robot_cube_clearance_m": clearance_state[
+            "min_cube_clearance_m"
+        ],
+        "link_clearance_violation": clearance_state["last_violation"],
         "brain_runtime": brain_runtime.summary(),
     }
     live_run_state["failures"].append(failure)
@@ -1311,6 +1569,219 @@ def grasp_center_position():
     return tcp_position + local_grasp_offset_world(tcp_rotation)
 
 
+def outward_grasp_offset(cube_position):
+    offset = float(args.grasp_outward_offset)
+    if abs(offset) <= 1e-9:
+        return np.zeros(3, dtype=float)
+    cube_position = np.asarray(cube_position, dtype=float)
+    direction_xy = cube_position[:2].copy()
+    norm = float(np.linalg.norm(direction_xy))
+    if not np.isfinite(norm) or norm <= 1e-6:
+        return np.zeros(3, dtype=float)
+    direction_xy /= norm
+    return np.array(
+        [direction_xy[0] * offset, direction_xy[1] * offset, 0.0],
+        dtype=float,
+    )
+
+
+def grasp_target_for_cube(cube_position):
+    cube_position = np.asarray(cube_position, dtype=float)
+    return (
+        cube_position
+        + np.array([0.0, 0.0, args.brain_terminal_servo_z_offset], dtype=float)
+        + outward_grasp_offset(cube_position)
+    )
+
+
+def find_monitored_link_prims():
+    stage = omni.usd.get_context().get_stage()
+    by_name = {}
+    for prim in stage.Traverse():
+        name = prim.GetName()
+        if name in MONITORED_LINK_NAMES and prim.IsValid():
+            by_name.setdefault(name, prim.GetPath())
+    ordered = [
+        {"name": name, "path": by_name[name]}
+        for name in MONITORED_LINK_NAMES
+        if name in by_name
+    ]
+    clearance_state["monitored_links"] = [
+        f"{item['name']}:{item['path']}" for item in ordered
+    ]
+    print(
+        "link_clearance_monitor "
+        f"enabled={clearance_state['enabled']} "
+        f"links={len(ordered)} "
+        f"threshold={clearance_state['threshold_m']:.4f}m",
+        flush=True,
+    )
+    return ordered
+
+
+monitored_link_prims = []
+
+
+def link_world_points():
+    global monitored_link_prims
+    if not clearance_state["enabled"]:
+        return []
+    if not monitored_link_prims:
+        monitored_link_prims = find_monitored_link_prims()
+    if not monitored_link_prims:
+        return []
+    stage = omni.usd.get_context().get_stage()
+    cache = UsdGeom.XformCache()
+    points = []
+    for item in monitored_link_prims:
+        prim = stage.GetPrimAtPath(item["path"])
+        if not prim or not prim.IsValid():
+            continue
+        matrix = cache.GetLocalToWorldTransform(prim)
+        translation = matrix.ExtractTranslation()
+        points.append(
+            {
+                "name": item["name"],
+                "position": np.array(
+                    [translation[0], translation[1], translation[2]],
+                    dtype=float,
+                ),
+            }
+        )
+    return points
+
+
+def point_to_aabb_distance(point, center, half):
+    point = np.asarray(point, dtype=float)
+    center = np.asarray(center, dtype=float)
+    half = np.asarray(half, dtype=float)
+    outside = np.maximum(np.abs(point - center) - half, 0.0)
+    return float(np.linalg.norm(outside))
+
+
+def sampled_segment_points(start, end, samples=7):
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+    for alpha in np.linspace(0.0, 1.0, max(int(samples), 2)):
+        yield start * (1.0 - alpha) + end * alpha
+
+
+def dynamic_clearance_bounds(phase):
+    bounds = list(obstacle_bounds)
+    allowed_cube_phases = set(clearance_state["cube_contact_allowed_phases"])
+    release_grace_active = payload_state.get("release_clearance_grace_frames", 0) > 0
+    if (
+        phase not in allowed_cube_phases
+        and not payload_state["held"]
+        and not release_grace_active
+        and "grasp" not in str(phase)
+    ):
+        cube_position = np.asarray(cube.get_world_pose()[0], dtype=float)
+        cube_half = np.ones(3, dtype=float) * (float(metadata["cube_size"]) / 2.0)
+        bounds.append(
+            {
+                "name": "cycle_cube",
+                "center": cube_position,
+                "half": cube_half,
+                "threshold_m": float(clearance_state["cube_threshold_m"]),
+                "radius_m": float(clearance_state["cube_radius_m"]),
+                "kind": "cube",
+            }
+        )
+    return bounds
+
+
+def check_link_clearance(phase):
+    if not clearance_state["enabled"]:
+        return
+    points = link_world_points()
+    if not points:
+        return
+    bounds = dynamic_clearance_bounds(phase)
+    if not bounds:
+        return
+    best = {
+        "clearance_m": float("inf"),
+        "link": None,
+        "obstacle": None,
+        "phase": phase,
+        "threshold_m": float(clearance_state["threshold_m"]),
+        "kind": "obstacle",
+    }
+    candidates = [(item["name"], item["position"]) for item in points]
+    for start, end in zip(points, points[1:]):
+        segment_name = f"{start['name']}->{end['name']}"
+        for sampled in sampled_segment_points(start["position"], end["position"]):
+            candidates.append((segment_name, sampled))
+    for link_name, point in candidates:
+        for obstacle in bounds:
+            radius = float(obstacle.get("radius_m", clearance_state["link_radius_m"]))
+            threshold = float(
+                obstacle.get("threshold_m", clearance_state["threshold_m"])
+            )
+            distance = point_to_aabb_distance(
+                point,
+                obstacle["center"],
+                obstacle["half"],
+            )
+            clearance = distance - radius
+            if clearance < best["clearance_m"]:
+                best = {
+                    "clearance_m": float(clearance),
+                    "link": link_name,
+                    "obstacle": obstacle["name"],
+                    "phase": phase,
+                    "threshold_m": threshold,
+                    "kind": obstacle.get("kind", "obstacle"),
+                }
+    min_clearance = clearance_state["min_clearance_m"]
+    if min_clearance is None or best["clearance_m"] < float(min_clearance):
+        clearance_state["min_clearance_m"] = best["clearance_m"]
+    if best["kind"] == "cube":
+        min_cube_clearance = clearance_state["min_cube_clearance_m"]
+        if min_cube_clearance is None or best["clearance_m"] < float(
+            min_cube_clearance
+        ):
+            clearance_state["min_cube_clearance_m"] = best["clearance_m"]
+    if best["clearance_m"] >= best["threshold_m"]:
+        return
+    violation = {
+        "phase": phase,
+        "link": best["link"],
+        "obstacle": best["obstacle"],
+        "clearance_m": best["clearance_m"],
+        "threshold_m": best["threshold_m"],
+        "kind": best["kind"],
+    }
+    clearance_state["last_violation"] = violation
+    clearance_state["violations"].append(violation)
+    print(
+        "link_clearance_violation "
+        f"phase={phase} link={violation['link']} "
+        f"obstacle={violation['obstacle']} "
+        f"kind={violation['kind']} "
+        f"clearance={violation['clearance_m']:.4f}m "
+        f"threshold={violation['threshold_m']:.4f}m",
+        flush=True,
+    )
+    if clearance_state["action"] == "stop":
+        raise RuntimeError(
+            "Robot link clearance violation: "
+            f"{violation['link']} to {violation['obstacle']} "
+            f"clearance={violation['clearance_m']:.4f}m "
+            f"threshold={violation['threshold_m']:.4f}m"
+        )
+
+
+def guarded_world_step(phase, render=None):
+    if render is None:
+        render = should_render_world()
+    world.step(render=render)
+    check_link_clearance(phase)
+    if payload_state.get("release_clearance_grace_frames", 0) > 0:
+        payload_state["release_clearance_grace_frames"] -= 1
+
+
 def terminal_servo_target(target_arm, target_gripper, phase, current_arm):
     if not args.brain_terminal_servo:
         return target_arm, target_gripper, False
@@ -1323,10 +1794,7 @@ def terminal_servo_target(target_arm, target_gripper, phase, current_arm):
 
     tcp_position, tcp_rotation = current_tcp_pose()
     cube_position = np.asarray(cube.get_world_pose()[0], dtype=float)
-    cube_target = cube_position + np.array(
-        [0.0, 0.0, args.brain_terminal_servo_z_offset],
-        dtype=float,
-    )
+    cube_target = grasp_target_for_cube(cube_position)
     target_tcp = cube_target - local_grasp_offset_world(tcp_rotation)
     error = target_tcp - tcp_position
     grasp_distance = float(np.linalg.norm(cube_target - grasp_center_position()))
@@ -1621,6 +2089,10 @@ def release_payload():
         GRASP_CUBE_TCP_LOCAL_OFFSET,
         dtype=float,
     )
+    payload_state["release_clearance_grace_frames"] = max(
+        int(args.release_cube_clearance_grace_frames),
+        0,
+    )
 
 
 def step_for(frames, arm_positions, gripper_position, phase):
@@ -1642,7 +2114,7 @@ def step_for(frames, arm_positions, gripper_position, phase):
             control_arm,
             control_gripper,
         )
-        world.step(render=should_render_world())
+        guarded_world_step(phase)
         update_attached_payload()
         capture_step(
             phase,
@@ -1652,6 +2124,115 @@ def step_for(frames, arm_positions, gripper_position, phase):
             control_gripper,
         )
     return True
+
+
+def ik_arm_for_tcp(target_position, current_arm):
+    try:
+        ik_action, success = fk_solver.compute_inverse_kinematics(
+            target_position=np.asarray(target_position, dtype=float),
+        )
+    except TypeError:
+        ik_action, success = fk_solver.compute_inverse_kinematics(
+            np.asarray(target_position, dtype=float)
+        )
+    except Exception as exc:
+        print(f"vertical_grasp_ik_error error={exc}", flush=True)
+        return None
+    if not success:
+        return None
+    ik_arm = _ik_arm_positions(ik_action, current_arm)
+    if ik_arm is None or not np.all(np.isfinite(ik_arm)):
+        return None
+    return ik_arm
+
+
+def step_direct_target(frames, arm_positions, gripper_position, phase):
+    for _ in range(frames):
+        if (
+            control_state["end_requested"]
+            or control_state["retry_requested"]
+            or not app.is_running()
+        ):
+            return False
+        apply_target(
+            robot,
+            dof_index,
+            arm_positions,
+            gripper_position,
+        )
+        guarded_world_step(phase)
+        update_attached_payload()
+        capture_step(
+            phase,
+            arm_positions,
+            gripper_position,
+            arm_positions,
+            gripper_position,
+        )
+    return True
+
+
+def run_vertical_grasp_approach(gripper_position):
+    if args.disable_vertical_grasp_servo or args.grasp_mode == "teleport":
+        return True
+    cube_position = np.asarray(cube.get_world_pose()[0], dtype=float)
+    cube_target = grasp_target_for_cube(cube_position)
+    hover_center = cube_target.copy()
+    hover_center[2] += float(args.vertical_grasp_hover_height)
+    frames_per_step = max(int(args.vertical_grasp_frames_per_step), 1)
+    descent_steps = max(int(args.vertical_grasp_steps), 2)
+
+    targets = [hover_center]
+    for alpha in np.linspace(0.0, 1.0, descent_steps)[1:]:
+        target = hover_center * (1.0 - alpha) + cube_target * alpha
+        targets.append(target)
+
+    for index, grasp_center_target in enumerate(targets):
+        tcp_position, tcp_rotation = current_tcp_pose()
+        target_tcp = (
+            np.asarray(grasp_center_target, dtype=float)
+            - local_grasp_offset_world(tcp_rotation)
+        )
+        current_arm = arm_positions()
+        ik_arm = ik_arm_for_tcp(target_tcp, current_arm)
+        if ik_arm is None:
+            print(
+                "vertical_grasp_ik_failed "
+                f"waypoint={index} target={target_tcp.round(4).tolist()}",
+                flush=True,
+            )
+            return True
+        if not step_direct_target(
+            frames_per_step,
+            ik_arm,
+            gripper_position,
+            "vertical_grasp",
+        ):
+            return False
+
+    distance = tcp_to_cube_distance()
+    xy_distance = float(
+        np.linalg.norm(
+            np.asarray(grasp_center_position(), dtype=float)[:2]
+            - cube_target[:2]
+        )
+    )
+    print(
+        "vertical_grasp_complete "
+        f"distance={distance:.4f}m xy_distance={xy_distance:.4f}m",
+        flush=True,
+    )
+    return True
+
+
+def close_gripper_in_place(frames, gripper_position):
+    current_arm = arm_positions()
+    return step_direct_target(
+        frames,
+        current_arm,
+        gripper_position,
+        "close_gripper",
+    )
 
 
 def align_for_no_teleport_grasp(arm_positions, gripper_position):
@@ -1732,8 +2313,13 @@ def reset_cycle():
     payload_state["max_cube_height_m"] = float(cube_initial_position[2])
     payload_state["teleport_shortcut_used"] = False
     payload_state["last_failure"] = None
+    payload_state["release_clearance_grace_frames"] = 0
+    clearance_state["min_clearance_m"] = None
+    clearance_state["min_cube_clearance_m"] = None
+    clearance_state["last_violation"] = None
+    clearance_state["violations"] = []
     for _ in range(30):
-        world.step(render=should_render_world())
+        guarded_world_step("reset_cycle")
 
 
 def arm_positions():
@@ -1744,10 +2330,14 @@ def arm_positions():
     )
 
 
+def current_arm_positions():
+    return arm_positions()
+
+
 def detect_and_plan():
     current_arm_positions = arm_positions()
     for _ in range(PHYSICS_FPS // 4):
-        world.step(render=should_render_world())
+        guarded_world_step("conveyor_return")
         capture_step(
             "observe_cube",
             current_arm_positions,
@@ -1853,19 +2443,27 @@ def run_pick_and_place(trajectories):
             status_label.text = f"Running: {phase_name}"
         print(f"phase={phase_name} waypoints={len(trajectory)}", flush=True)
 
+        if (
+            phase_name == "descend_to_cube"
+            and not args.disable_vertical_grasp_servo
+            and args.grasp_mode != "teleport"
+        ):
+            print(
+                "phase=descend_to_cube skipped_for_single_vertical_grasp",
+                flush=True,
+            )
+            continue
+
         if phase_name == "lift_cube":
-            gripper_position = CLOSED_GRIPPER
-            if not step_for(
-                100,
-                trajectory[0],
-                gripper_position,
-                "close_gripper",
-            ):
+            if not run_vertical_grasp_approach(OPEN_GRIPPER):
                 return False
             if not align_for_no_teleport_grasp(
-                trajectory[0],
-                gripper_position,
+                current_arm_positions(),
+                OPEN_GRIPPER,
             ):
+                return False
+            gripper_position = CLOSED_GRIPPER
+            if not close_gripper_in_place(100, gripper_position):
                 return False
             if not begin_payload_grasp():
                 return False
@@ -1924,6 +2522,13 @@ def run_pick_and_place(trajectories):
             and not payload_state["teleport_shortcut_used"]
         ),
         "teleport_shortcut_used": payload_state["teleport_shortcut_used"],
+        "minimum_robot_obstacle_clearance_m": clearance_state[
+            "min_clearance_m"
+        ],
+        "minimum_robot_cube_clearance_m": clearance_state[
+            "min_cube_clearance_m"
+        ],
+        "link_clearance_violations": list(clearance_state["violations"]),
     }
 
 
@@ -1950,7 +2555,7 @@ def return_cube_on_conveyor(hold_positions):
             control_arm,
             control_gripper,
         )
-        world.step(render=should_render_world())
+        guarded_world_step("observe_cube")
         capture_step(
             "conveyor_return",
             hold_positions,
@@ -1982,7 +2587,7 @@ def return_cube_on_conveyor(hold_positions):
                     control_arm,
                     control_gripper,
                 )
-                world.step(render=should_render_world())
+                guarded_world_step("conveyor_settle")
                 capture_step(
                     "conveyor_settle",
                     hold_positions,
@@ -2076,7 +2681,7 @@ try:
                     control_arm,
                     control_gripper,
                 )
-                world.step(render=should_render_world())
+                guarded_world_step("observe_returned_cube")
                 capture_step(
                     "observe_returned_cube",
                     hold_positions,
@@ -2088,7 +2693,15 @@ try:
                 **pick_metrics,
                 **conveyor_metrics,
                 "conveyor_speed_mps": args.conveyor_speed,
-                "clearance_m": 0.012,
+                "minimum_robot_obstacle_clearance_m": clearance_state[
+                    "min_clearance_m"
+                ],
+                "minimum_robot_cube_clearance_m": clearance_state[
+                    "min_cube_clearance_m"
+                ],
+                "link_clearance_violations": list(
+                    clearance_state["violations"]
+                ),
                 "brain_control": args.brain_control,
             }
             if brain_runtime is not None:
@@ -2157,7 +2770,15 @@ try:
                             and not payload_state["teleport_shortcut_used"]
                         ),
                         "conveyor_speed_mps": args.conveyor_speed,
-                        "clearance_m": 0.012,
+                        "minimum_robot_obstacle_clearance_m": clearance_state[
+                            "min_clearance_m"
+                        ],
+                        "minimum_robot_cube_clearance_m": clearance_state[
+                            "min_cube_clearance_m"
+                        ],
+                        "link_clearance_violations": list(
+                            clearance_state["violations"]
+                        ),
                         "brain_control": args.brain_control,
                     }
                     if brain_runtime is not None:
