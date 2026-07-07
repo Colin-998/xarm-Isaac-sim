@@ -7,3 +7,8 @@
 /outputs/
 __pycache__/
 *.pyc
+*.ckpt
+*.onnx
+*.pth
+*.pt
+*.safetensors

@@ -44,9 +44,115 @@ This repository is currently a **simulation research prototype**. The goal is to
 
 ---
 
-## 2. Main Tasks / 主要任務
+## 2. Demo Videos / 展示影片
 
-### 2.1 Conveyor-Cycle Pick-and-Place / 輸送帶循環夾取
+### 2.1 Basket Throw Showcase / 投籃展示
+
+<video src="docs/media/basket_throw_showcase_2026-07-07.mp4" controls width="100%"></video>
+
+[Download / Open basket throw showcase video](docs/media/basket_throw_showcase_2026-07-07.mp4)
+
+中文：這段影片展示 xArm6 夾起紅色方塊後，透過 gripper swing 產生拋投趨勢，並使用 basket kinematic flight visualization 將方塊穩定顯示為落入籃框。這個任務用於展示多任務具身控制、投籃場景與未來 VLA 泛化方向。
+
+English: This video shows the xArm6 grasping the red cube, generating a throwing trend through gripper swing motion, and using basket kinematic flight visualization to stably show the cube landing inside the basket. This task demonstrates multi-task embodied control, the basket-throw scene, and future VLA generalization directions.
+
+### 2.2 Conveyor-Cycle Showcase / 輸送帶循環展示
+
+<video src="docs/media/conveyor_cycle_showcase_2026-06-18.mp4" controls width="100%"></video>
+
+[Download / Open conveyor-cycle showcase video](docs/media/conveyor_cycle_showcase_2026-06-18.mp4)
+
+中文：這段影片展示 xArm6 在半圓形輸送帶任務中偵測紅色方塊、抓取、避開障礙物、放置到輸送帶起點，並讓方塊回流到終點的閉環流程。這是本專案 Level 1 / Level 2 驗收與資料採集的核心任務。
+
+English: This video shows the xArm6 detecting the red cube, grasping it, avoiding obstacles, placing it at the conveyor start, and letting the conveyor return the cube to the pickup end. This is the core task for Level 1 / Level 2 validation and dataset collection.
+
+> 中文：影片檔案使用 Git LFS 管理，避免大型 MP4 直接膨脹 Git history。
+>
+> English: Video files are managed with Git LFS to avoid bloating the normal Git history with large MP4 files.
+
+---
+
+## 3. Model Weights / 模型權重
+
+### 中文
+
+本 repository **不直接放大型模型權重**。原因如下：
+
+- V-JEPA2、Llama 3.1、SmolVLA-style policy、Stage 3 policy checkpoint 可能很大。
+- GitHub 一般 Git 檔案有大小限制，且大型權重會讓 clone 速度變慢。
+- 部分模型需要 Hugging Face 權限或授權，不適合直接放在公開 Git repo。
+- 訓練輸出會隨實驗大量變動，應該保存在 `outputs/`、GitHub Release、Hugging Face Hub / Dataset、雲端硬碟或 Git LFS，而不是直接放進一般 Git history。
+
+建議模型與資料放置方式：
+
+```text
+outputs/
+|-- smolvla_xarm6_level2/
+|   `-- best_smolvla_policy.pt
+|-- rlds_xarm6_curobo/
+|-- brain_dagger_takeover/
+`-- smolvla_multitask_dagger/
+```
+
+`.gitignore` 已排除常見權重格式：
+
+```text
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+```
+
+若需要分享模型，建議使用：
+
+- GitHub Releases
+- Hugging Face Hub
+- Git LFS
+- Google Drive / OneDrive
+
+### English
+
+This repository **does not store large model weights directly**. The reasons are:
+
+- V-JEPA2, Llama 3.1, SmolVLA-style policies, and Stage 3 policy checkpoints can be large.
+- Large files slow down cloning and may hit GitHub file-size limits.
+- Some models require Hugging Face access approval or license acceptance, so they should not be redistributed directly in a public Git repository.
+- Training outputs change frequently and should be stored under `outputs/`, GitHub Releases, Hugging Face Hub / Dataset, cloud storage, or Git LFS instead of normal Git history.
+
+Recommended local layout:
+
+```text
+outputs/
+|-- smolvla_xarm6_level2/
+|   `-- best_smolvla_policy.pt
+|-- rlds_xarm6_curobo/
+|-- brain_dagger_takeover/
+`-- smolvla_multitask_dagger/
+```
+
+Common model weight formats are ignored:
+
+```text
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+```
+
+Recommended sharing options:
+
+- GitHub Releases
+- Hugging Face Hub
+- Git LFS
+- Google Drive / OneDrive
+
+---
+
+## 4. Main Tasks / 主要任務
+
+### 4.1 Conveyor-Cycle Pick-and-Place / 輸送帶循環夾取
 
 #### 中文
 
@@ -80,7 +186,7 @@ Task sequence:
 
 ---
 
-### 2.2 Basket-Throw Showcase / 投籃展示任務
+### 4.2 Basket-Throw Showcase / 投籃展示任務
 
 #### 中文
 
@@ -100,7 +206,7 @@ This task is not meant to replace physical validation. It is a stable, visual, r
 
 ---
 
-## 3. Key Features / 主要功能
+## 5. Key Features / 主要功能
 
 ### 中文
 
@@ -176,7 +282,7 @@ This task is not meant to replace physical validation. It is a stable, visual, r
 
 ---
 
-## 4. Project Status / 目前進度
+## 6. Project Status / 目前進度
 
 ### 中文
 
@@ -232,7 +338,7 @@ Still research prototype:
 
 ---
 
-## 5. Repository Layout / 專案結構
+## 7. Repository Layout / 專案結構
 
 ```text
 .
@@ -273,7 +379,7 @@ The `outputs/`, `build/`, `vendor/`, `tools/`, and `__pycache__/` directories ar
 
 ---
 
-## 6. Environment / 執行環境
+## 8. Environment / 執行環境
 
 ### 中文
 
@@ -311,7 +417,7 @@ Most scripts depend on the Isaac Sim runtime. Use the bundled Isaac Sim Python:
 
 ---
 
-## 7. xArm6 Assets / xArm6 模型資產
+## 9. xArm6 Assets / xArm6 模型資產
 
 ### 中文
 
@@ -361,7 +467,7 @@ This project reorganizes UFACTORY's official `xarm_ros2` / `xarm_description` as
 
 ---
 
-## 8. Quick Start / 快速開始
+## 10. Quick Start / 快速開始
 
 ### 8.1 Rebuild Combined Arm + Gripper USD / 重建手臂與夾爪 USD
 
@@ -383,7 +489,7 @@ English: This demo uses PhysX contact between the gripper and the cube. It does 
 
 ---
 
-## 9. Conveyor Cycle Demo / 輸送帶循環展示
+## 11. Conveyor Cycle Demo / 輸送帶循環展示
 
 ### Preview / 預覽場景
 
@@ -404,7 +510,7 @@ cd C:\Users\User\Documents\XArm
 
 ---
 
-## 10. Dynamic cuRobo Pick-and-Place / 動態 cuRobo 夾取與放置
+## 12. Dynamic cuRobo Pick-and-Place / 動態 cuRobo 夾取與放置
 
 ### Plan / 產生規劃
 
@@ -429,7 +535,7 @@ cd C:\Users\User\Documents\XArm
 
 ---
 
-## 11. Basket Throw Showcase / 投籃展示
+## 13. Basket Throw Showcase / 投籃展示
 
 ```powershell
 cd C:\Users\User\Documents\XArm
@@ -483,7 +589,7 @@ cd C:\Users\User\Documents\XArm
 
 ---
 
-## 12. Dataset Collection / 資料採集
+## 14. Dataset Collection / 資料採集
 
 ### 中文
 
@@ -527,7 +633,7 @@ This directory is ignored by Git. To share datasets, use Hugging Face Dataset, G
 
 ---
 
-## 13. RLDS Packaging / RLDS 資料集打包
+## 15. RLDS Packaging / RLDS 資料集打包
 
 ```powershell
 cd C:\Users\User\Documents\XArm
@@ -550,7 +656,7 @@ English: The RLDS-shaped package preserves episode metadata, step-level observat
 
 ---
 
-## 14. Multimodal Training Pipeline / 多模態訓練流程
+## 16. Multimodal Training Pipeline / 多模態訓練流程
 
 ### Stage 1: Projector Alignment / 投影層對齊
 
@@ -599,7 +705,7 @@ cd C:\Users\User\Documents\XArm
 
 ---
 
-## 15. DAgger Strategy / DAgger 策略
+## 17. DAgger Strategy / DAgger 策略
 
 ### 中文
 
@@ -630,7 +736,7 @@ cd C:\Users\User\Documents\XArm
 
 ---
 
-## 16. Validation Criteria / 驗收條件
+## 18. Validation Criteria / 驗收條件
 
 ### Level 1: Single-cycle success / 單輪成功
 
@@ -677,7 +783,7 @@ cd C:\Users\User\Documents\XArm
 
 ---
 
-## 17. What Is Not Included / 沒有放進 Git 的內容
+## 19. What Is Not Included / 沒有放進 Git 的內容
 
 ### 中文
 
@@ -719,7 +825,7 @@ To share these artifacts, use:
 
 ---
 
-## 18. Research Direction / 研究方向
+## 20. Research Direction / 研究方向
 
 ### 中文
 
@@ -789,7 +895,7 @@ Long-term directions:
 
 ---
 
-## 19. Safety Disclaimer / 安全聲明
+## 21. Safety Disclaimer / 安全聲明
 
 ### 中文
 
@@ -801,7 +907,7 @@ This repository is a simulation research prototype. Do not directly deploy the g
 
 ---
 
-## 20. Acknowledgements / 致謝
+## 22. Acknowledgements / 致謝
 
 - UFACTORY xArm ROS 2 assets:
 
@@ -813,4 +919,3 @@ https://github.com/xArm-Developer/xarm_ros2
 - cuRobo
 - V-JEPA2 research direction
 - SmolVLA / VLA-style embodied policy direction
-
