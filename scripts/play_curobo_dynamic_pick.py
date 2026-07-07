@@ -1,5 +1,5 @@
 """Visualize and physically execute a saved cuRobo xArm6 pick plan in Isaac Sim."""
-
+import numpy as np
 import argparse
 from datetime import datetime, timezone
 import json
@@ -76,6 +76,11 @@ parser.add_argument(
     help="Number of cycles in headless mode; the GUI loops until End is pressed.",
 )
 parser.add_argument(
+    "--stop-after-cycles",
+    action="store_true",
+    help="Also stop GUI runs after --cycles attempts; useful for visible gates.",
+)
+parser.add_argument(
     "--brain-control",
     choices=["off", "observe", "filtered", "direct"],
     default="off",
@@ -90,11 +95,213 @@ parser.add_argument(
     type=Path,
     default=Path("outputs/stage3_video_sft_500ep_w4/latest_stage3_policy.pt"),
 )
+parser.add_argument(
+    "--task-name",
+    default=None,
+    help="Logical task label recorded into DAgger/RLDS metadata.",
+)
+parser.add_argument(
+    "--task-instruction",
+    default=None,
+    help="Natural-language instruction for SmolVLA inference and recording.",
+)
+parser.add_argument(
+    "--disable-conveyor-return",
+    action="store_true",
+    help="End each cycle after placing the cube; useful for non-conveyor tasks.",
+)
+parser.add_argument(
+    "--task-success-distance",
+    type=float,
+    default=0.10,
+    help="XY distance threshold from task place target for task success.",
+)
+parser.add_argument(
+    "--basket-center",
+    default=None,
+    help=(
+        "Override basket center as x,y,z in metres for basket_drop. The "
+        "robot still releases at metadata place_position."
+    ),
+)
+parser.add_argument(
+    "--basket-release-velocity",
+    default=None,
+    help=(
+        "Override basket release velocity as vx,vy,vz in metres/second. "
+        "Used only by --basket-velocity-mode metadata."
+    ),
+)
+parser.add_argument(
+    "--basket-velocity-mode",
+    choices=["metadata", "model", "analytic", "gripper"],
+    default="metadata",
+    help=(
+        "How basket_drop chooses release velocity: metadata uses a fixed "
+        "value, model asks a learned ballistic policy, analytic is a "
+        "non-learning physics baseline, and gripper inherits velocity from "
+        "the physical gripper swing before opening."
+    ),
+)
+parser.add_argument(
+    "--basket-release-policy",
+    type=Path,
+    default=ROOT / "outputs/smolvla_multitask_dagger/ballistic_throw_policy.pt",
+    help="Checkpoint for --basket-velocity-mode model.",
+)
+parser.add_argument(
+    "--basket-analytic-flight-time",
+    type=float,
+    default=None,
+    help=(
+        "Optional fixed flight time for analytic basket velocity. If omitted, "
+        "a distance-based flight time is used."
+    ),
+)
+parser.add_argument(
+    "--basket-gripper-throw-frames",
+    type=int,
+    default=8,
+    help="Number of fast servo frames used to swing the held cube before release.",
+)
+parser.add_argument(
+    "--basket-gripper-throw-speed-scale",
+    type=float,
+    default=0.85,
+    help=(
+        "Scale applied to the internally planned gripper swing displacement. "
+        "This changes gripper motion, not cube velocity directly."
+    ),
+)
+parser.add_argument(
+    "--basket-gripper-throw-lift",
+    type=float,
+    default=0.080,
+    help="Extra upward gripper swing displacement in metres before release.",
+)
+parser.add_argument(
+    "--basket-flight-settle-frames",
+    type=int,
+    default=90,
+    help="Frames to hold after a gripper throw release so the cube visibly flies.",
+)
+parser.add_argument(
+    "--basket-flight-mode",
+    choices=["kinematic", "physics"],
+    default="kinematic",
+    help=(
+        "How to show the cube after release. kinematic uses the gripper-derived "
+        "release velocity and gravity to animate a stable ballistic arc; "
+        "physics lets PhysX free-flight the cube."
+    ),
+)
+parser.add_argument(
+    "--basket-min-flight-frames",
+    type=int,
+    default=90,
+    help=(
+        "Minimum visible flight frames for basket_drop. This prevents older "
+        "commands with --basket-flight-settle-frames 0 from ending at release."
+    ),
+)
+parser.add_argument(
+    "--basket-success-distance",
+    type=float,
+    default=0.12,
+    help="XY distance threshold from basket center for basket_drop success.",
+)
+parser.add_argument(
+    "--basket-gripper-release-open-frames",
+    type=int,
+    default=0,
+    help=(
+        "Frames to visibly open the gripper after release. Defaults to 0 "
+        "because Isaac Sim 5.1 can shut down when stepping PhysX immediately "
+        "after this basket release path."
+    ),
+)
 parser.add_argument("--brain-device", default="cuda")
 parser.add_argument("--brain-local-files-only", action="store_true")
 parser.add_argument("--brain-blend", type=float, default=0.35)
 parser.add_argument("--brain-max-teacher-delta", type=float, default=0.45)
 parser.add_argument("--brain-max-step-delta", type=float, default=0.08)
+parser.add_argument(
+    "--brain-delta-gain",
+    type=float,
+    default=1.0,
+    help=(
+        "Scale delta-action checkpoints at runtime before rate limiting. "
+        "This is useful for DAgger gates where the learned direction is "
+        "correct but too small to reach the next phase."
+    ),
+)
+parser.add_argument(
+    "--brain-posture-blend",
+    type=float,
+    default=0.65,
+    help=(
+        "For tcp_delta_posture checkpoints, blend this fraction of the "
+        "learned joint2-4 posture residual into the IK result. The TCP "
+        "still comes from the learned Cartesian delta; this only lets the "
+        "brain bias the arm body away from obstacles."
+    ),
+)
+parser.add_argument(
+    "--brain-strict-direct",
+    action="store_true",
+    help=(
+        "In direct mode, never fall back to a teacher action. Hold position "
+        "while the visual clip warms up and fail the episode on invalid or "
+        "phase-mismatched predictions so the failure can become DAgger data."
+    ),
+)
+parser.add_argument(
+    "--brain-observe-fps",
+    type=float,
+    default=4.0,
+    help=(
+        "How often the online V-JEPA2/Stage-3 observer runs. Higher values "
+        "make the visualized predicted EE path update more often, but cost "
+        "more GPU time. Dataset recording remains 4 FPS."
+    ),
+)
+parser.add_argument(
+    "--brain-phase-hold-frames",
+    type=int,
+    default=360,
+    help=(
+        "Extra frames a brain-controlled run may hold the current phase until "
+        "the end-effector reaches the phase geometry target. This prevents "
+        "the task scheduler from switching to descent/lift before the policy "
+        "has actually arrived."
+    ),
+)
+parser.add_argument(
+    "--brain-approach-ready-distance",
+    type=float,
+    default=0.12,
+    help=(
+        "Brain phase-hold distance in meters from the grasp center to the "
+        "hover grasp target before approach_cube may advance."
+    ),
+)
+parser.add_argument(
+    "--brain-descend-ready-distance",
+    type=float,
+    default=0.030,
+    help=(
+        "Brain phase-hold distance in meters from the grasp center to the "
+        "cube grasp target before descend_to_cube may advance."
+    ),
+)
+parser.add_argument(
+    "--show-brain-ee-path",
+    action="store_true",
+    help=(
+        "Draw V-JEPA2/Stage-3 predicted end-effector path as USD overlay "
+        "points for now, 0.5s, 1.0s, and 2.0s."
+    ),
+)
 parser.add_argument(
     "--brain-allow-phase-mismatch",
     action="store_true",
@@ -245,6 +452,25 @@ parser.add_argument(
     help="Required cube XY distance from conveyor start before release.",
 )
 parser.add_argument(
+    "--disable-brain-grasp-readiness-gate",
+    action="store_true",
+    help=(
+        "Allow brain-control runs to close/lift without first proving the "
+        "TCP is inside the configured grasp attach distance. Intended only "
+        "for ablations; the default keeps the claw open until the grasp is "
+        "physically reachable."
+    ),
+)
+parser.add_argument(
+    "--brain-grasp-readiness-frames",
+    type=int,
+    default=480,
+    help=(
+        "Maximum extra brain-controlled frames allowed before lift_cube to "
+        "move the open gripper into grasp attach distance."
+    ),
+)
+parser.add_argument(
     "--brain-place-servo-hover-height",
     type=float,
     default=0.18,
@@ -307,6 +533,33 @@ parser.add_argument(
     help="Stop the cycle or only warn when a link clearance violation occurs.",
 )
 parser.add_argument(
+    "--brain-clearance-intervention-margin",
+    type=float,
+    default=0.0,
+    help=(
+        "DAgger collection helper. When direct brain control brings a robot "
+        "link within threshold + this margin of an obstacle, execute and "
+        "record a teacher recovery instead of waiting for the monitor to stop."
+    ),
+)
+parser.add_argument(
+    "--brain-clearance-intervention-away",
+    type=float,
+    default=0.06,
+    help="Meters to move the teacher TCP target along the clearance away vector.",
+)
+parser.add_argument(
+    "--brain-clearance-intervention-lift",
+    type=float,
+    default=0.04,
+    help="Meters to lift the teacher TCP target during clearance intervention.",
+)
+parser.add_argument(
+    "--brain-clearance-intervention-phases",
+    default="approach_cube,descend_to_cube,carry_to_start,place_cube",
+    help="Comma-separated phases where clearance intervention may collect DAgger data.",
+)
+parser.add_argument(
     "--cube-clearance-threshold",
     type=float,
     default=0.004,
@@ -353,6 +606,17 @@ GRASP_CUBE_TCP_LOCAL_OFFSET = parse_vec3(
     args.grasp_cube_tcp_local_offset,
     "--grasp-cube-tcp-local-offset",
 )
+BASKET_CENTER_OVERRIDE = (
+    None
+    if args.basket_center is None
+    else parse_vec3(args.basket_center, "--basket-center")
+)
+BASKET_RELEASE_VELOCITY_OVERRIDE = (
+    None
+    if args.basket_release_velocity is None
+    else parse_vec3(args.basket_release_velocity, "--basket-release-velocity")
+)
+ballistic_policy_bundle = None
 
 ROBOT_USD = ROOT / "assets/xarm6_gripper/xarm6_gripper.usd"
 ISAAC_PYTHON = Path.home() / "isaac_sim_5.1" / "python.bat"
@@ -361,7 +625,9 @@ RUNTIME_REQUEST = ROOT / "outputs/curobo_runtime_request.json"
 RUNTIME_PLAN = ROOT / "outputs/curobo_runtime_plan.npz"
 PHYSICS_FPS = 120
 CAPTURE_FPS = 4
-CAPTURE_INTERVAL = PHYSICS_FPS // CAPTURE_FPS
+RECORD_CAPTURE_INTERVAL = PHYSICS_FPS // CAPTURE_FPS
+brain_observe_fps = float(np.clip(float(args.brain_observe_fps), 1.0, PHYSICS_FPS))
+CAPTURE_INTERVAL = max(1, int(round(PHYSICS_FPS / brain_observe_fps)))
 CAPTURE_RESOLUTION = (256, 256)
 MIN_EPISODE_FRAMES = 64
 BELT_RADIUS = 0.43
@@ -407,7 +673,6 @@ app = SimulationApp(
     }
 )
 
-import numpy as np
 import carb
 import omni.kit.commands
 import omni.replicator.core as rep
@@ -552,6 +817,136 @@ def set_conveyor_speed(graph_nodes, speed):
         ).Set(float(speed))
 
 
+def basket_config_for_task(task_name, metadata):
+    config = None
+    if metadata.get("basket") is not None:
+        config = dict(metadata["basket"])
+    elif task_name == "basket_drop":
+        place_position = np.asarray(metadata["place_position"], dtype=float)
+        config = {
+            "center": [
+                float(place_position[0]),
+                float(place_position[1]),
+                max(0.055, float(place_position[2]) - 0.10),
+            ],
+            "inner_size": [0.20, 0.20],
+            "wall_height": 0.08,
+        }
+    if config is None:
+        return None
+    if BASKET_CENTER_OVERRIDE is not None:
+        config["center"] = np.asarray(BASKET_CENTER_OVERRIDE, dtype=float).tolist()
+    if BASKET_RELEASE_VELOCITY_OVERRIDE is not None:
+        config["release_velocity"] = np.asarray(
+            BASKET_RELEASE_VELOCITY_OVERRIDE,
+            dtype=float,
+        ).tolist()
+    return config
+
+
+def create_basket_target(world, config):
+    center = np.asarray(config["center"], dtype=float)
+    inner_size = np.asarray(config.get("inner_size", [0.16, 0.16]), dtype=float)
+    wall_height = float(config.get("wall_height", 0.08))
+    wall_thickness = float(config.get("wall_thickness", 0.015))
+    floor_thickness = float(config.get("floor_thickness", 0.012))
+    floor_top_z = float(center[2])
+    rim_z = floor_top_z + wall_height
+    cx, cy = float(center[0]), float(center[1])
+    sx, sy = float(inner_size[0]), float(inner_size[1])
+    objects = []
+
+    def add_box(name, position, scale, color):
+        objects.append(
+            world.scene.add(
+                FixedCuboid(
+                    prim_path=f"/World/Basket/{name}",
+                    name=f"basket_{name.lower()}",
+                    position=np.asarray(position, dtype=float),
+                    scale=np.asarray(scale, dtype=float),
+                    color=np.asarray(color, dtype=float),
+                )
+            )
+        )
+
+    add_box(
+        "Floor",
+        [cx, cy, floor_top_z - floor_thickness / 2.0],
+        [sx + 2.0 * wall_thickness, sy + 2.0 * wall_thickness, floor_thickness],
+        [0.10, 0.13, 0.16],
+    )
+    wall_z = floor_top_z + wall_height / 2.0
+    add_box(
+        "LeftWall",
+        [cx - sx / 2.0 - wall_thickness / 2.0, cy, wall_z],
+        [wall_thickness, sy + 2.0 * wall_thickness, wall_height],
+        [0.92, 0.24, 0.05],
+    )
+    add_box(
+        "RightWall",
+        [cx + sx / 2.0 + wall_thickness / 2.0, cy, wall_z],
+        [wall_thickness, sy + 2.0 * wall_thickness, wall_height],
+        [0.92, 0.24, 0.05],
+    )
+    add_box(
+        "FrontWall",
+        [cx, cy + sy / 2.0 + wall_thickness / 2.0, wall_z],
+        [sx + 2.0 * wall_thickness, wall_thickness, wall_height],
+        [0.92, 0.24, 0.05],
+    )
+    add_box(
+        "BackWall",
+        [cx, cy - sy / 2.0 - wall_thickness / 2.0, wall_z],
+        [sx + 2.0 * wall_thickness, wall_thickness, wall_height],
+        [0.92, 0.24, 0.05],
+    )
+    rim_thickness = wall_thickness * 1.2
+    add_box(
+        "RimFront",
+        [cx, cy + sy / 2.0 + rim_thickness / 2.0, rim_z + rim_thickness / 2.0],
+        [sx + 2.0 * rim_thickness, rim_thickness, rim_thickness],
+        [1.0, 0.35, 0.02],
+    )
+    add_box(
+        "RimBack",
+        [cx, cy - sy / 2.0 - rim_thickness / 2.0, rim_z + rim_thickness / 2.0],
+        [sx + 2.0 * rim_thickness, rim_thickness, rim_thickness],
+        [1.0, 0.35, 0.02],
+    )
+    add_box(
+        "RimLeft",
+        [cx - sx / 2.0 - rim_thickness / 2.0, cy, rim_z + rim_thickness / 2.0],
+        [rim_thickness, sy + 2.0 * rim_thickness, rim_thickness],
+        [1.0, 0.35, 0.02],
+    )
+    add_box(
+        "RimRight",
+        [cx + sx / 2.0 + rim_thickness / 2.0, cy, rim_z + rim_thickness / 2.0],
+        [rim_thickness, sy + 2.0 * rim_thickness, rim_thickness],
+        [1.0, 0.35, 0.02],
+    )
+    backboard_y = cy - sy / 2.0 - 0.045
+    add_box(
+        "Backboard",
+        [cx, backboard_y, rim_z + 0.08],
+        [0.26, 0.018, 0.20],
+        [0.94, 0.94, 0.90],
+    )
+    add_box(
+        "Stand",
+        [cx, backboard_y - 0.025, floor_top_z / 2.0],
+        [0.025, 0.025, max(floor_top_z, 0.04)],
+        [0.15, 0.15, 0.16],
+    )
+    print(
+        "basket_target_created "
+        f"center={center.round(4).tolist()} "
+        f"rim_z={rim_z:.4f} inner_size={inner_size.round(4).tolist()}",
+        flush=True,
+    )
+    return objects
+
+
 def bind_finger_material(stage, physics_material):
     bound = []
     for prim in stage.TraverseAll():
@@ -647,12 +1042,15 @@ class Stage3BrainRuntime:
         blend,
         max_teacher_delta,
         max_step_delta,
+        delta_gain,
+        instruction_override=None,
     ):
         import torch
         from PIL import Image
         from torchvision import transforms
         from train_stage3_video_sft import Stage3Policy
         from train_stage3_direct_correction import StateConditionedStage3Policy
+        from train_smolvla_policy import SmolVLAPolicy, instruction_to_hash_tokens
 
         self.torch = torch
         self.image_cls = Image
@@ -670,7 +1068,11 @@ class Stage3BrainRuntime:
         self.clip_frames = int(config["clip_frames"])
         self.image_size = int(config["image_size"])
         self.policy_arch = checkpoint.get("policy_arch", "stage3_video")
+        self.action_representation = checkpoint.get(
+            "action_representation", "absolute"
+        )
         self.state_conditioned = self.policy_arch == "state_conditioned"
+        self.smolvla = self.policy_arch == "smolvla"
         self.device = torch.device(
             device
             if device == "cpu" or torch.cuda.is_available()
@@ -686,7 +1088,7 @@ class Stage3BrainRuntime:
                 ),
             ]
         )
-        if self.state_conditioned:
+        if self.state_conditioned or self.smolvla:
             self.state_mean = torch.tensor(
                 checkpoint["state_mean"],
                 dtype=torch.float32,
@@ -697,16 +1099,53 @@ class Stage3BrainRuntime:
                 dtype=torch.float32,
                 device=self.device,
             ).clamp_min(1e-4)
-            self.model = StateConditionedStage3Policy(
-                config["vjepa2_model_id"],
-                int(config["embed_dim"]),
-                len(self.phase_to_id),
-                int(self.state_mean.numel()),
-                local_files_only,
-            ).to(self.device)
+            if self.smolvla:
+                instruction = config.get(
+                    "instruction",
+                    (
+                        "Pick up the red cube and place it at the conveyor "
+                        "start while avoiding obstacles."
+                    ),
+                )
+                if instruction_override:
+                    instruction = str(instruction_override)
+                token_count = int(config.get("text_token_count", 16))
+                text_buckets = int(config.get("text_hash_buckets", 512))
+                saved_tokens = checkpoint.get("instruction_tokens")
+                if instruction_override or saved_tokens is None:
+                    saved_tokens = instruction_to_hash_tokens(
+                        instruction,
+                        text_buckets,
+                        token_count,
+                    )
+                self.instruction_tokens = torch.as_tensor(
+                    saved_tokens,
+                    dtype=torch.long,
+                    device=self.device,
+                ).view(1, -1)
+                self.model = SmolVLAPolicy(
+                    config["vjepa2_model_id"],
+                    int(config["embed_dim"]),
+                    len(self.phase_to_id),
+                    int(self.state_mean.numel()),
+                    int(config.get("action_chunk_size", 4)),
+                    text_buckets,
+                    token_count,
+                    local_files_only,
+                ).to(self.device)
+            else:
+                self.instruction_tokens = None
+                self.model = StateConditionedStage3Policy(
+                    config["vjepa2_model_id"],
+                    int(config["embed_dim"]),
+                    len(self.phase_to_id),
+                    int(self.state_mean.numel()),
+                    local_files_only,
+                ).to(self.device)
         else:
             self.state_mean = None
             self.state_std = None
+            self.instruction_tokens = None
             self.model = Stage3Policy(
                 config["vjepa2_model_id"],
                 int(config["embed_dim"]),
@@ -718,6 +1157,8 @@ class Stage3BrainRuntime:
         self.blend = float(np.clip(blend, 0.0, 1.0))
         self.max_teacher_delta = float(max_teacher_delta)
         self.max_step_delta = float(max_step_delta)
+        self.delta_gain = max(float(delta_gain), 0.0)
+        self.instruction = None if not self.smolvla else instruction
         self.frames = []
         self.physics_frame = 0
         self.latest = None
@@ -764,18 +1205,40 @@ class Stage3BrainRuntime:
                 .unsqueeze(0)
                 .to(self.device)
             )
-            if self.state_conditioned:
+            if self.state_conditioned or self.smolvla:
                 if state is None:
                     return
+                model_state = np.asarray(state, dtype=float)
+                expected_state_dim = int(self.state_mean.numel())
+                if model_state.size < expected_state_dim:
+                    model_state = np.pad(
+                        model_state,
+                        (0, expected_state_dim - model_state.size),
+                        mode="constant",
+                    )
+                elif model_state.size > expected_state_dim:
+                    model_state = model_state[:expected_state_dim]
                 state_tensor = self.torch.tensor(
-                    state,
+                    model_state,
                     dtype=self.torch.float32,
                     device=self.device,
                 ).unsqueeze(0)
                 state_tensor = (state_tensor - self.state_mean) / self.state_std
-                phase_logits, action_pred = self.model(batch, state_tensor)
+                if self.smolvla:
+                    phase_logits, action_pred, chunk_pred = self.model(
+                        batch,
+                        state_tensor,
+                        self.instruction_tokens,
+                    )
+                    action_chunk = (
+                        chunk_pred[0].detach().cpu().numpy().astype(float)
+                    )
+                else:
+                    phase_logits, action_pred = self.model(batch, state_tensor)
+                    action_chunk = None
             else:
                 phase_logits, action_pred = self.model(batch)
+                action_chunk = None
             predicted_phase_id = int(phase_logits.argmax(dim=-1).item())
             action = action_pred[0].detach().cpu().numpy().astype(float)
         predicted_phase = self.id_to_phase.get(
@@ -793,7 +1256,9 @@ class Stage3BrainRuntime:
             "predicted_phase": predicted_phase,
             "predicted_phase_id": predicted_phase_id,
             "action": action,
+            "action_chunk": action_chunk,
             "phase_match": phase_match,
+            "state": None if state is None else np.asarray(state, dtype=float),
         }
         print(
             "brain_predict "
@@ -811,28 +1276,92 @@ class Stage3BrainRuntime:
         current_gripper,
         phase,
     ):
-        if mode == "off" or self.latest is None:
+        if mode == "off":
             self.stats["fallback"] += 1
             return teacher_arm, teacher_gripper, "teacher"
-        if mode == "observe":
-            self.stats["observe_steps"] += 1
-            return teacher_arm, teacher_gripper, "observe"
+        if self.latest is None:
+            if mode == "direct" and args.brain_strict_direct:
+                return current_arm, current_gripper, "warmup_hold"
+            self.stats["fallback"] += 1
+            return teacher_arm, teacher_gripper, "teacher"
 
         action = self.latest["action"]
         if len(action) < 14 or not np.all(np.isfinite(action)):
             self.stats["rejected"] += 1
+            if mode == "direct" and args.brain_strict_direct:
+                raise RuntimeError("Strict brain direct rejected a non-finite action")
             return teacher_arm, teacher_gripper, "reject_nonfinite"
 
-        policy_arm = np.asarray(action[-7:-1], dtype=float)
-        policy_gripper = float(np.clip(action[-1], OPEN_GRIPPER, CLOSED_GRIPPER))
+        raw_policy_arm = np.asarray(action[-7:-1], dtype=float)
+        raw_policy_gripper = float(action[-1])
+        if self.action_representation in {"tcp_delta", "tcp_delta_posture"}:
+            anchor_state = self.latest.get("state")
+            if anchor_state is None or len(anchor_state) < 10:
+                anchor_tcp, _ = current_tcp_pose()
+                anchor_gripper = current_gripper
+                anchor_arm = current_arm
+            else:
+                anchor_tcp = np.asarray(anchor_state[7:10], dtype=float)
+                anchor_gripper = float(anchor_state[6])
+                anchor_arm = np.asarray(anchor_state[:6], dtype=float)
+            target_tcp = anchor_tcp + raw_policy_arm[:3] * self.delta_gain
+            policy_arm = ik_arm_for_tcp(target_tcp, current_arm)
+            if policy_arm is None:
+                self.stats["rejected"] += 1
+                if mode == "direct" and args.brain_strict_direct:
+                    raise RuntimeError(
+                        "Strict brain direct rejected an unsolved tcp_delta IK target"
+                    )
+                self.stats["fallback"] += 1
+                return teacher_arm, teacher_gripper, "reject_tcp_delta_ik"
+            if self.action_representation == "tcp_delta_posture":
+                posture_blend = float(np.clip(args.brain_posture_blend, 0.0, 1.0))
+                posture_target = np.asarray(policy_arm, dtype=float).copy()
+                posture_target[1:4] = (
+                    anchor_arm[1:4] + raw_policy_arm[3:6] * self.delta_gain
+                )
+                policy_arm[1:4] = (
+                    (1.0 - posture_blend) * policy_arm[1:4]
+                    + posture_blend * posture_target[1:4]
+                )
+            policy_gripper = anchor_gripper + raw_policy_gripper * self.delta_gain
+        elif self.action_representation == "delta":
+            anchor_state = self.latest.get("state")
+            if anchor_state is None or len(anchor_state) < 7:
+                anchor_arm = current_arm
+                anchor_gripper = current_gripper
+            else:
+                anchor_arm = np.asarray(anchor_state[:6], dtype=float)
+                anchor_gripper = float(anchor_state[6])
+            policy_arm = anchor_arm + raw_policy_arm * self.delta_gain
+            policy_gripper = anchor_gripper + raw_policy_gripper * self.delta_gain
+        else:
+            policy_arm = raw_policy_arm
+            policy_gripper = raw_policy_gripper
+        policy_gripper = float(
+            np.clip(policy_gripper, OPEN_GRIPPER, CLOSED_GRIPPER)
+        )
         if policy_arm.shape != (6,):
             self.stats["rejected"] += 1
+            if mode == "direct" and args.brain_strict_direct:
+                raise RuntimeError(
+                    f"Strict brain direct rejected action shape {policy_arm.shape}"
+                )
             return teacher_arm, teacher_gripper, "reject_shape"
+        update_brain_path_overlay(current_arm, policy_arm)
+        if mode == "observe":
+            self.stats["observe_steps"] += 1
+            return teacher_arm, teacher_gripper, "observe"
 
         teacher_delta = float(np.max(np.abs(policy_arm - teacher_arm)))
         phase_match = self.latest["predicted_phase"] == phase
         if not args.brain_allow_phase_mismatch and not phase_match:
             self.stats["rejected"] += 1
+            if mode == "direct" and args.brain_strict_direct:
+                raise RuntimeError(
+                    "Strict brain direct phase mismatch: "
+                    f"expected={phase} predicted={self.latest['predicted_phase']}"
+                )
             self.stats["fallback"] += 1
             return teacher_arm, teacher_gripper, "reject_phase"
         if mode == "filtered":
@@ -882,6 +1411,15 @@ class Stage3BrainRuntime:
             "checkpoint": str(self.checkpoint_path),
             "device": str(self.device),
             "policy_arch": self.policy_arch,
+            "action_representation": self.action_representation,
+            "instruction": self.instruction,
+            "action_chunk_size": int(
+                0
+                if self.latest is None
+                or self.latest.get("action_chunk") is None
+                else len(self.latest["action_chunk"])
+            ),
+            "delta_gain": self.delta_gain,
             "clip_frames": self.clip_frames,
             "stats": dict(self.stats),
             "latest": latest,
@@ -900,6 +1438,20 @@ plan_data = np.load(plan_path)
 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 phases = metadata["phases"]
 phase_names = [phase["name"] for phase in phases]
+task_name = (
+    args.task_name
+    or metadata.get("task_name")
+    or ("conveyor_cycle" if not args.disable_conveyor_return else "place_task")
+)
+task_instruction = (
+    args.task_instruction
+    or metadata.get("task_instruction")
+    or (
+        "Pick up the red cube and place it at the conveyor start while avoiding obstacles."
+        if task_name == "conveyor_cycle"
+        else f"Pick up the red cube and complete task {task_name}."
+    )
+)
 
 omni.usd.get_context().open_stage(str(ROBOT_USD))
 for _ in range(10):
@@ -946,6 +1498,10 @@ for index, obstacle in enumerate(metadata["obstacles"]):
         )
         )
     )
+basket_objects = []
+basket_config = basket_config_for_task(task_name, metadata)
+if basket_config is not None:
+    basket_objects = create_basket_target(world, basket_config)
 
 grip_material = PhysicsMaterial(
     prim_path="/World/Materials/GripperPhysics",
@@ -992,6 +1548,92 @@ lula = LulaKinematicsSolver(
 )
 fk_solver = ArticulationKinematicsSolver(robot, lula, "link_tcp")
 
+brain_path_overlay = {
+    "enabled": bool(args.show_brain_ee_path),
+    "points": [],
+    "curve": None,
+    "labels": ["now", "0.5s", "1.0s", "2.0s"],
+    "horizons_s": [0.0, 0.5, 1.0, 2.0],
+}
+
+
+def setup_brain_path_overlay():
+    if not brain_path_overlay["enabled"]:
+        return
+    stage = omni.usd.get_context().get_stage()
+    root_path = "/World/BrainPredictionPath"
+    UsdGeom.Xform.Define(stage, root_path)
+    colors = [
+        Gf.Vec3f(0.05, 0.95, 1.0),
+        Gf.Vec3f(0.10, 0.85, 0.30),
+        Gf.Vec3f(1.00, 0.85, 0.10),
+        Gf.Vec3f(1.00, 0.20, 0.85),
+    ]
+    for index, color in enumerate(colors):
+        sphere = UsdGeom.Sphere.Define(stage, f"{root_path}/Point_{index}")
+        sphere.CreateRadiusAttr(0.026 if index == 0 else 0.022)
+        sphere.CreateDisplayColorAttr([color])
+        xform = UsdGeom.Xformable(sphere.GetPrim())
+        translate = xform.AddTranslateOp()
+        translate.Set(Gf.Vec3d(0.0, 0.0, -10.0))
+        brain_path_overlay["points"].append(
+            {"sphere": sphere, "translate": translate}
+        )
+    curve = UsdGeom.BasisCurves.Define(stage, f"{root_path}/PathLine")
+    curve.CreateTypeAttr("linear")
+    curve.CreateCurveVertexCountsAttr([len(colors)])
+    curve.CreateWidthsAttr([0.014])
+    curve.CreateDisplayColorAttr([Gf.Vec3f(0.05, 0.95, 1.0)])
+    curve.CreatePointsAttr([Gf.Vec3f(0.0, 0.0, -10.0)] * len(colors))
+    brain_path_overlay["curve"] = curve
+
+
+def update_brain_path_overlay(current_arm, policy_arm):
+    if not brain_path_overlay["enabled"] or not brain_path_overlay["points"]:
+        return
+    if policy_arm is None or not np.all(np.isfinite(policy_arm)):
+        return
+    current_arm = np.asarray(current_arm, dtype=float)
+    policy_arm = np.asarray(policy_arm, dtype=float)
+    if current_arm.shape != (6,) or policy_arm.shape != (6,):
+        return
+    points = []
+    for horizon in brain_path_overlay["horizons_s"]:
+        if horizon <= 0.0:
+            predicted_arm = current_arm
+        else:
+            max_delta = float(args.brain_max_step_delta) * PHYSICS_FPS * float(horizon)
+            predicted_arm = current_arm + np.clip(
+                policy_arm - current_arm,
+                -max_delta,
+                max_delta,
+            )
+        try:
+            position, _ = lula.compute_forward_kinematics(
+                "link_tcp",
+                predicted_arm,
+            )
+        except Exception:
+            return
+        position = np.asarray(position, dtype=float)
+        if not np.all(np.isfinite(position)):
+            return
+        points.append(position)
+    for point, overlay in zip(points, brain_path_overlay["points"]):
+        overlay["translate"].Set(
+            Gf.Vec3d(float(point[0]), float(point[1]), float(point[2]))
+        )
+    if brain_path_overlay["curve"] is not None:
+        brain_path_overlay["curve"].GetPointsAttr().Set(
+            [
+                Gf.Vec3f(float(point[0]), float(point[1]), float(point[2]))
+                for point in points
+            ]
+        )
+
+
+setup_brain_path_overlay()
+
 
 class EpisodeRecorder:
     def __init__(self, root, episode_index, annotator):
@@ -1014,19 +1656,21 @@ class EpisodeRecorder:
         gripper_target,
         executed_arm=None,
         executed_gripper=None,
+        safety_violation=None,
     ):
         frame = self.physics_frame
         self.physics_frame += 1
-        if frame % CAPTURE_INTERVAL:
+        if safety_violation is None and frame % RECORD_CAPTURE_INTERVAL:
             return
-        if not args.headless:
-            rep.orchestrator.step(
-                rt_subframes=2,
-                delta_time=0.0,
-                pause_timeline=False,
-            )
+        rep.orchestrator.step(
+            rt_subframes=2,
+            delta_time=0.0,
+            pause_timeline=False,
+        )
         image_name = f"rgb_{len(self.rows):06d}.png"
         rgba = np.asarray(self.annotator.get_data())
+        if rgba.ndim < 3 or rgba.shape[0] <= 0 or rgba.shape[1] <= 0:
+            raise RuntimeError(f"Invalid RGB frame shape: {rgba.shape}")
         Image.fromarray(rgba).convert("RGB").save(
             self.temp_dir / image_name
         )
@@ -1035,6 +1679,16 @@ class EpisodeRecorder:
         actual_positions = np.asarray(robot.get_joint_positions())
         actual_velocities = np.asarray(robot.get_joint_velocities())
         oracle_arm = np.asarray(arm_target, dtype=float)
+        try:
+            oracle_tcp_position, _ = lula.compute_forward_kinematics(
+                "link_tcp",
+                oracle_arm,
+            )
+            oracle_tcp_position = np.asarray(oracle_tcp_position, dtype=float)
+            if not np.all(np.isfinite(oracle_tcp_position)):
+                oracle_tcp_position = None
+        except Exception:
+            oracle_tcp_position = None
         executed_arm = (
             oracle_arm
             if executed_arm is None
@@ -1045,6 +1699,110 @@ class EpisodeRecorder:
             if executed_gripper is None
             else float(executed_gripper)
         )
+        brain_prediction = None
+        if brain_runtime is not None and brain_runtime.latest is not None:
+            latest = brain_runtime.latest
+            raw_action = np.asarray(latest["action"], dtype=float)
+            raw_arm = raw_action[-7:-1]
+            raw_gripper = float(raw_action[-1])
+            predicted_tcp_target = None
+            if brain_runtime.action_representation in {"tcp_delta", "tcp_delta_posture"}:
+                anchor_state = latest.get("state")
+                if anchor_state is None or len(anchor_state) < 10:
+                    anchor_tcp = np.asarray(tcp_position, dtype=float)
+                    anchor_arm = np.asarray(
+                        [
+                            actual_positions[dof_index[f"joint{i}"]]
+                            for i in range(1, 7)
+                        ],
+                        dtype=float,
+                    )
+                    anchor_gripper = float(
+                        actual_positions[dof_index[GRIPPER_JOINTS[0]]]
+                    )
+                else:
+                    anchor_tcp = np.asarray(anchor_state[7:10], dtype=float)
+                    anchor_arm = np.asarray(anchor_state[:6], dtype=float)
+                    anchor_gripper = float(anchor_state[6])
+                delta_gain = float(brain_runtime.delta_gain)
+                predicted_tcp_target = anchor_tcp + raw_arm[:3] * delta_gain
+                decoded_arm = ik_arm_for_tcp(
+                    predicted_tcp_target,
+                    np.asarray(
+                        [
+                            actual_positions[dof_index[f"joint{i}"]]
+                            for i in range(1, 7)
+                        ],
+                        dtype=float,
+                    ),
+                )
+                predicted_arm = (
+                    np.full(6, np.nan, dtype=float)
+                    if decoded_arm is None
+                    else np.asarray(decoded_arm, dtype=float)
+                )
+                if (
+                    brain_runtime.action_representation == "tcp_delta_posture"
+                    and np.all(np.isfinite(predicted_arm))
+                ):
+                    posture_blend = float(np.clip(args.brain_posture_blend, 0.0, 1.0))
+                    posture_target = predicted_arm.copy()
+                    posture_target[1:4] = anchor_arm[1:4] + raw_arm[3:6] * delta_gain
+                    predicted_arm[1:4] = (
+                        (1.0 - posture_blend) * predicted_arm[1:4]
+                        + posture_blend * posture_target[1:4]
+                    )
+                predicted_gripper = anchor_gripper + raw_gripper * delta_gain
+            elif brain_runtime.action_representation == "delta":
+                anchor_state = latest.get("state")
+                if anchor_state is None or len(anchor_state) < 7:
+                    anchor_arm = np.asarray(
+                        [
+                            actual_positions[dof_index[f"joint{i}"]]
+                            for i in range(1, 7)
+                        ],
+                        dtype=float,
+                    )
+                    anchor_gripper = float(
+                        actual_positions[dof_index[GRIPPER_JOINTS[0]]]
+                    )
+                else:
+                    anchor_arm = np.asarray(anchor_state[:6], dtype=float)
+                    anchor_gripper = float(anchor_state[6])
+                delta_gain = float(brain_runtime.delta_gain)
+                predicted_arm = anchor_arm + raw_arm * delta_gain
+                predicted_gripper = anchor_gripper + raw_gripper * delta_gain
+            else:
+                delta_gain = 1.0
+                predicted_arm = raw_arm
+                predicted_gripper = raw_gripper
+            brain_prediction = {
+                "phase": latest["phase"],
+                "predicted_phase": latest["predicted_phase"],
+                "phase_match": bool(latest["phase_match"]),
+                "action_representation": brain_runtime.action_representation,
+                "delta_gain": delta_gain,
+                "arm_joint_positions": predicted_arm.tolist(),
+                "gripper_joint_position": predicted_gripper,
+                "raw_arm_action": raw_arm.tolist(),
+                "raw_gripper_action": raw_gripper,
+                "tcp_target_position": (
+                    None
+                    if predicted_tcp_target is None
+                    else predicted_tcp_target.tolist()
+                ),
+            }
+        expert_correction = None
+        if brain_prediction is not None:
+            expert_correction = {
+                "arm_delta": (
+                    oracle_arm
+                    - np.asarray(brain_prediction["arm_joint_positions"], dtype=float)
+                ).tolist(),
+                "gripper_delta": float(gripper_target)
+                - float(brain_prediction["gripper_joint_position"]),
+            }
+        clearance_features = clearance_features_for_phase(phase)
         self.rows.append(
             {
                 "frame": frame,
@@ -1054,10 +1812,20 @@ class EpisodeRecorder:
                 "action": {
                     "arm_joint_positions": oracle_arm.tolist(),
                     "gripper_joint_position": float(gripper_target),
+                    "tcp_position": (
+                        None
+                        if oracle_tcp_position is None
+                        else oracle_tcp_position.tolist()
+                    ),
                 },
                 "executed_action": {
                     "arm_joint_positions": executed_arm.tolist(),
                     "gripper_joint_position": executed_gripper,
+                },
+                "dagger": {
+                    "brain_action": brain_prediction,
+                    "expert_correction": expert_correction,
+                    "safety_violation": safety_violation,
                 },
                 "observation": {
                     "arm_joint_positions": [
@@ -1089,13 +1857,38 @@ class EpisodeRecorder:
                         }
                         for obstacle in obstacle_objects
                     ],
+                    "clearance": {
+                        "clearance_m": clearance_features[0],
+                        "threshold_m": clearance_features[1],
+                        "clearance_margin_m": clearance_features[2],
+                        "kind": (
+                            "cube"
+                            if clearance_features[3] > 0.5
+                            else "obstacle"
+                        ),
+                        "away_vector": clearance_features[4:7],
+                    },
                 },
             }
         )
 
     def finish(self, metrics, success=True, error=None):
-        if len(self.rows) < 2:
+        if len(self.rows) < 2 and success:
             raise RuntimeError("Episode has too few captured observations")
+        violations = metrics.get("link_clearance_violations") or []
+        if self.rows:
+            has_labeled_violation = any(
+                row.get("dagger", {}).get("safety_violation") is not None
+                for row in self.rows
+            )
+            if violations and not has_labeled_violation:
+                self.rows[-1]["dagger"]["safety_violation"] = violations[-1]
+            elif not success and not has_labeled_violation:
+                self.rows[-1]["dagger"]["safety_violation"] = {
+                    "kind": "episode_failure",
+                    "reason": None if error is None else str(error),
+                    "payload_failure": metrics.get("payload_failure"),
+                }
         with (self.temp_dir / "actions.jsonl").open(
             "w",
             encoding="utf-8",
@@ -1110,15 +1903,15 @@ class EpisodeRecorder:
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "physics_fps": PHYSICS_FPS,
             "capture_fps": CAPTURE_FPS,
-            "capture_interval_frames": CAPTURE_INTERVAL,
+            "capture_interval_frames": RECORD_CAPTURE_INTERVAL,
+            "brain_observe_fps": brain_observe_fps,
+            "brain_observe_interval_frames": CAPTURE_INTERVAL,
             "resolution": list(CAPTURE_RESOLUTION),
             "frames_written": len(self.rows),
             "minimum_episode_frames": MIN_EPISODE_FRAMES,
-            "task": (
-                "Detect and pick the cube at the conveyor end, avoid "
-                "obstacles, place it at the conveyor start, and wait for "
-                "the conveyor to return it."
-            ),
+            "task": task_instruction,
+            "task_name": task_name,
+            "task_instruction": task_instruction,
             "teacher_policy": "cuRobo dynamic collision-aware planning",
             "executed_policy": args.brain_control,
             "dagger_oracle_actions": True,
@@ -1210,6 +2003,8 @@ brain_runtime = (
         args.brain_blend,
         args.brain_max_teacher_delta,
         args.brain_max_step_delta,
+        args.brain_delta_gain,
+        task_instruction,
     )
     if brain_enabled
     else None
@@ -1236,6 +2031,18 @@ control_state = {
 status_label = None
 command_field = None
 command_feedback_label = None
+
+
+def app_allows_automation_step():
+    return bool(args.headless or app.is_running())
+
+
+def warmup_simulation_app(frames=90):
+    for _ in range(max(int(frames), 0)):
+        if not app_allows_automation_step():
+            return False
+        app.update()
+    return True
 
 
 def set_command_feedback(message):
@@ -1365,6 +2172,17 @@ payload_state = {
     "teleport_shortcut_used": False,
     "last_failure": None,
     "release_clearance_grace_frames": 0,
+    "motion_samples": [],
+    "release_velocity_mps": None,
+    "release_velocity_source": None,
+    "gripper_throw_velocity_mps": None,
+    "basket_release_arm_positions": None,
+    "basket_landed": False,
+}
+grasp_readiness_state = {
+    "ready": False,
+    "best_distance_m": None,
+    "last_distance_m": None,
 }
 clearance_state = {
     "enabled": not args.disable_link_clearance_monitor,
@@ -1439,6 +2257,8 @@ def update_dataset_manifest(failed_attempts=0):
         "resolution": list(CAPTURE_RESOLUTION),
         "teacher_policy": "cuRobo dynamic collision-aware planning",
         "brain_control": args.brain_control,
+        "task_name": task_name,
+        "task_instruction": task_instruction,
     }
     (record_root / "dataset_manifest.json").write_text(
         json.dumps(manifest, indent=2),
@@ -1455,6 +2275,8 @@ def write_brain_run_report():
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "brain_control": args.brain_control,
         "brain_policy": str(args.brain_policy.resolve()),
+        "task_name": task_name,
+        "task_instruction": task_instruction,
         "conveyor_speed_mps": args.conveyor_speed,
         "cycles": live_run_state["cycles"],
         "failures": live_run_state["failures"],
@@ -1466,7 +2288,7 @@ def write_brain_run_report():
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
-def current_brain_state():
+def current_brain_state(phase=None):
     positions = np.asarray(robot.get_joint_positions(), dtype=float)
     arm_state = [
         float(positions[dof_index[f"joint{i}"]])
@@ -1475,11 +2297,13 @@ def current_brain_state():
     gripper_state = float(positions[dof_index[GRIPPER_JOINTS[0]]])
     tcp_position, _ = fk_solver.compute_end_effector_pose()
     cube_position = cube.get_world_pose()[0]
+    clearance = clearance_features_for_phase(phase or "unknown")
     return (
         arm_state
         + [gripper_state]
         + np.asarray(tcp_position, dtype=float).tolist()
         + np.asarray(cube_position, dtype=float).tolist()
+        + clearance
     )
 
 
@@ -1513,18 +2337,34 @@ def capture_step(
     gripper_target,
     executed_arm=None,
     executed_gripper=None,
+    safety_violation=None,
 ):
     recorder = recording_state["recorder"]
     if recorder is not None:
-        recorder.capture(
-            phase,
-            arm_target,
-            gripper_target,
-            executed_arm,
-            executed_gripper,
-        )
+        try:
+            recorder.capture(
+                phase,
+                arm_target,
+                gripper_target,
+                executed_arm,
+                executed_gripper,
+                safety_violation,
+            )
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:
+            raise RuntimeError(
+                f"Episode RGB/action capture failed during {phase}: {exc}"
+            ) from exc
     if brain_runtime is not None and rgb_annotator is not None:
-        brain_runtime.observe(rgb_annotator, phase, current_brain_state())
+        try:
+            brain_runtime.observe(rgb_annotator, phase, current_brain_state(phase))
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:
+            raise RuntimeError(
+                f"Brain online observation failed during {phase}: {exc}"
+            ) from exc
 
 
 def _ik_arm_positions(action, current_arm):
@@ -1659,6 +2499,25 @@ def point_to_aabb_distance(point, center, half):
     return float(np.linalg.norm(outside))
 
 
+def point_to_aabb_clearance_direction(point, center, half):
+    point = np.asarray(point, dtype=float)
+    center = np.asarray(center, dtype=float)
+    half = np.asarray(half, dtype=float)
+    delta = point - center
+    closest = center + np.clip(delta, -half, half)
+    away = point - closest
+    norm = float(np.linalg.norm(away))
+    if norm > 1e-6:
+        return float(norm), (away / norm).astype(float)
+
+    # If the point is inside the box, point toward the nearest exit face.
+    penetration = half - np.abs(delta)
+    axis = int(np.argmin(penetration))
+    direction = np.zeros(3, dtype=float)
+    direction[axis] = 1.0 if delta[axis] >= 0.0 else -1.0
+    return 0.0, direction
+
+
 def sampled_segment_points(start, end, samples=7):
     start = np.asarray(start, dtype=float)
     end = np.asarray(end, dtype=float)
@@ -1691,15 +2550,39 @@ def dynamic_clearance_bounds(phase):
     return bounds
 
 
-def check_link_clearance(phase):
+def best_link_clearance(phase):
     if not clearance_state["enabled"]:
-        return
+        return {
+            "clearance_m": 1.0,
+            "link": None,
+            "obstacle": None,
+            "phase": phase,
+            "threshold_m": float(clearance_state["threshold_m"]),
+            "kind": "obstacle",
+            "away_vector": [0.0, 0.0, 0.0],
+        }
     points = link_world_points()
     if not points:
-        return
+        return {
+            "clearance_m": 1.0,
+            "link": None,
+            "obstacle": None,
+            "phase": phase,
+            "threshold_m": float(clearance_state["threshold_m"]),
+            "kind": "obstacle",
+            "away_vector": [0.0, 0.0, 0.0],
+        }
     bounds = dynamic_clearance_bounds(phase)
     if not bounds:
-        return
+        return {
+            "clearance_m": 1.0,
+            "link": None,
+            "obstacle": None,
+            "phase": phase,
+            "threshold_m": float(clearance_state["threshold_m"]),
+            "kind": "obstacle",
+            "away_vector": [0.0, 0.0, 0.0],
+        }
     best = {
         "clearance_m": float("inf"),
         "link": None,
@@ -1707,6 +2590,7 @@ def check_link_clearance(phase):
         "phase": phase,
         "threshold_m": float(clearance_state["threshold_m"]),
         "kind": "obstacle",
+        "away_vector": [0.0, 0.0, 0.0],
     }
     candidates = [(item["name"], item["position"]) for item in points]
     for start, end in zip(points, points[1:]):
@@ -1719,7 +2603,7 @@ def check_link_clearance(phase):
             threshold = float(
                 obstacle.get("threshold_m", clearance_state["threshold_m"])
             )
-            distance = point_to_aabb_distance(
+            distance, away_vector = point_to_aabb_clearance_direction(
                 point,
                 obstacle["center"],
                 obstacle["half"],
@@ -1733,7 +2617,33 @@ def check_link_clearance(phase):
                     "phase": phase,
                     "threshold_m": threshold,
                     "kind": obstacle.get("kind", "obstacle"),
+                    "away_vector": away_vector.tolist(),
                 }
+    return best
+
+
+def clearance_features_for_phase(phase):
+    best = best_link_clearance(phase)
+    clearance_m = float(best.get("clearance_m", 1.0))
+    threshold_m = float(best.get("threshold_m", clearance_state["threshold_m"]))
+    away_vector = np.asarray(best.get("away_vector", [0.0, 0.0, 0.0]), dtype=float)
+    if away_vector.size != 3 or not np.all(np.isfinite(away_vector)):
+        away_vector = np.zeros(3, dtype=float)
+    return [
+        clearance_m,
+        threshold_m,
+        clearance_m - threshold_m,
+        1.0 if best.get("kind") == "cube" else 0.0,
+        float(away_vector[0]),
+        float(away_vector[1]),
+        float(away_vector[2]),
+    ]
+
+
+def check_link_clearance(phase):
+    if not clearance_state["enabled"]:
+        return
+    best = best_link_clearance(phase)
     min_clearance = clearance_state["min_clearance_m"]
     if min_clearance is None or best["clearance_m"] < float(min_clearance):
         clearance_state["min_clearance_m"] = best["clearance_m"]
@@ -1858,6 +2768,121 @@ def cube_to_place_distance():
     return float(np.linalg.norm(cube_position[:2] - place_position[:2]))
 
 
+def task_success_position():
+    if task_name == "basket_drop" and basket_config is not None:
+        return np.asarray(
+            basket_config.get("center", metadata["place_position"]),
+            dtype=float,
+        )
+    return np.asarray(metadata["place_position"], dtype=float)
+
+
+def basket_distance_for_position(position):
+    if task_name != "basket_drop" or basket_config is None:
+        return None
+    basket_center = np.asarray(
+        basket_config.get("center", metadata["place_position"]),
+        dtype=float,
+    )
+    position = np.asarray(position, dtype=float)
+    return float(np.linalg.norm(position[:2] - basket_center[:2]))
+
+
+def basket_success_distance():
+    return float(args.basket_success_distance)
+
+
+def basket_landing_position():
+    if task_name != "basket_drop" or basket_config is None:
+        return None
+    center = np.asarray(
+        basket_config.get("center", metadata["place_position"]),
+        dtype=float,
+    )
+    landing = center.copy()
+    landing[2] = float(center[2]) + float(metadata["cube_size"]) / 2.0 + 0.005
+    return landing
+
+
+def analytic_basket_release_velocity(release_position, basket_center):
+    release_position = np.asarray(release_position, dtype=float)
+    basket_center = np.asarray(basket_center, dtype=float)
+    delta = basket_center - release_position
+    horizontal_distance = float(np.linalg.norm(delta[:2]))
+    if args.basket_analytic_flight_time is None:
+        flight_time = float(np.clip(0.32 + 0.25 * horizontal_distance, 0.34, 0.52))
+    else:
+        flight_time = max(float(args.basket_analytic_flight_time), 0.05)
+    return np.asarray(
+        [
+            delta[0] / flight_time,
+            delta[1] / flight_time,
+            (delta[2] + 0.5 * 9.81 * flight_time * flight_time) / flight_time,
+        ],
+        dtype=float,
+    )
+
+
+def basket_release_velocity_for(release_position):
+    global ballistic_policy_bundle
+    if task_name != "basket_drop" or basket_config is None:
+        return None, None
+    basket_center = np.asarray(
+        basket_config.get("center", metadata["place_position"]),
+        dtype=float,
+    )
+    if args.basket_velocity_mode == "gripper":
+        release_velocity = payload_state.get("gripper_throw_velocity_mps")
+        if release_velocity is None:
+            release_velocity = inherited_payload_velocity()
+        if release_velocity is None:
+            return None, None
+        return np.asarray(release_velocity, dtype=float), "gripper_motion"
+    if args.basket_velocity_mode == "metadata":
+        release_velocity = basket_config.get("release_velocity")
+        if release_velocity is None:
+            return None, None
+        return np.asarray(release_velocity, dtype=float), "metadata"
+    if args.basket_velocity_mode == "analytic":
+        return (
+            analytic_basket_release_velocity(release_position, basket_center),
+            "analytic",
+        )
+    if ballistic_policy_bundle is None:
+        from train_ballistic_throw_policy import (
+            load_ballistic_policy,
+            predict_release_velocity,
+        )
+
+        if not args.basket_release_policy.exists():
+            raise FileNotFoundError(
+                "Missing basket release policy checkpoint: "
+                f"{args.basket_release_policy}. Run "
+                "scripts/train_ballistic_throw_policy.py first."
+            )
+        device = args.brain_device if args.brain_device == "cpu" else "cuda"
+        ballistic_policy_bundle = (
+            load_ballistic_policy(args.basket_release_policy, device=device),
+            predict_release_velocity,
+        )
+        print(
+            f"basket_release_policy_loaded={args.basket_release_policy}",
+            flush=True,
+        )
+    model_bundle, predict_release_velocity = ballistic_policy_bundle
+    return (
+        np.asarray(
+            predict_release_velocity(
+                model_bundle,
+                release_position,
+                basket_center,
+            ),
+            dtype=float,
+        ),
+        "model",
+    )
+
+
 def place_servo_target(target_arm, target_gripper, phase, current_arm):
     if not (args.brain_place_servo or args.brain_terminal_servo):
         return target_arm, target_gripper, False
@@ -1949,14 +2974,31 @@ def choose_control_target(teacher_arm, teacher_gripper, phase):
         brain_runtime is not None
         and not args.brain_terminal_servo_without_vision
     ):
-        target_arm, target_gripper, source = brain_runtime.choose_target(
-            args.brain_control,
-            teacher_arm,
-            float(teacher_gripper),
-            current_arm,
-            current_gripper,
-            phase,
-        )
+        try:
+            target_arm, target_gripper, source = brain_runtime.choose_target(
+                args.brain_control,
+                teacher_arm,
+                float(teacher_gripper),
+                current_arm,
+                current_gripper,
+                phase,
+            )
+        except RuntimeError as exc:
+            recorder = recording_state["recorder"]
+            if recorder is not None:
+                recorder.capture(
+                    phase,
+                    teacher_arm,
+                    float(teacher_gripper),
+                    current_arm,
+                    current_gripper,
+                    {
+                        "kind": "policy_rejection",
+                        "phase": phase,
+                        "reason": str(exc),
+                    },
+                )
+            raise
         if (
             source in {"filtered", "direct"}
             and brain_runtime.stats["accepted"] % CAPTURE_INTERVAL == 0
@@ -1967,6 +3009,70 @@ def choose_control_target(teacher_arm, teacher_gripper, phase):
                 f"gripper={target_gripper:.3f}",
                 flush=True,
             )
+        intervention_phases = {
+            item.strip()
+            for item in str(args.brain_clearance_intervention_phases).split(",")
+            if item.strip()
+        }
+        if (
+            args.brain_control == "direct"
+            and args.brain_clearance_intervention_margin > 0.0
+            and source in {"direct", "filtered"}
+            and phase in intervention_phases
+        ):
+            best = best_link_clearance(phase)
+            trigger_clearance = (
+                float(best["threshold_m"])
+                + float(args.brain_clearance_intervention_margin)
+            )
+            if best["kind"] == "obstacle" and best["clearance_m"] < trigger_clearance:
+                tcp_position, _ = current_tcp_pose()
+                away_vector = np.asarray(
+                    best.get("away_vector", [0.0, 0.0, 0.0]),
+                    dtype=float,
+                )
+                norm = float(np.linalg.norm(away_vector))
+                if norm > 1e-6:
+                    recovery_tcp = (
+                        np.asarray(tcp_position, dtype=float)
+                        + away_vector / norm
+                        * float(args.brain_clearance_intervention_away)
+                    )
+                else:
+                    recovery_tcp = np.asarray(tcp_position, dtype=float)
+                recovery_tcp[2] += float(args.brain_clearance_intervention_lift)
+                recovery_arm = ik_arm_for_tcp(recovery_tcp, current_arm)
+                if recovery_arm is not None:
+                    safety_event = {
+                        "kind": "clearance_intervention",
+                        "phase": phase,
+                        "link": best["link"],
+                        "obstacle": best["obstacle"],
+                        "clearance_m": best["clearance_m"],
+                        "threshold_m": best["threshold_m"],
+                        "trigger_clearance_m": trigger_clearance,
+                        "away_vector": best.get("away_vector", [0.0, 0.0, 0.0]),
+                    }
+                    recorder = recording_state["recorder"]
+                    if recorder is not None:
+                        recorder.capture(
+                            phase,
+                            recovery_arm,
+                            OPEN_GRIPPER,
+                            target_arm,
+                            target_gripper,
+                            safety_event,
+                        )
+                    target_arm = np.asarray(recovery_arm, dtype=float)
+                    target_gripper = OPEN_GRIPPER
+                    print(
+                        "brain_clearance_intervention "
+                        f"phase={phase} link={best['link']} "
+                        f"clearance={best['clearance_m']:.4f}m "
+                        f"trigger={trigger_clearance:.4f}m "
+                        f"target={np.asarray(target_arm).round(4).tolist()}",
+                        flush=True,
+                    )
     elif args.brain_terminal_servo_without_vision:
         target_arm = teacher_arm
         target_gripper = float(teacher_gripper)
@@ -2002,6 +3108,25 @@ def choose_control_target(teacher_arm, teacher_gripper, phase):
             f"gripper={target_gripper:.3f}",
             flush=True,
         )
+    if (
+        not args.disable_brain_grasp_readiness_gate
+        and brain_runtime is not None
+        and args.brain_control in {"filtered", "direct"}
+        and not payload_state["held"]
+        and args.grasp_mode != "teleport"
+        and phase in {"approach_cube", "descend_to_cube", "close_gripper"}
+    ):
+        distance, ready = update_grasp_readiness()
+        if not ready:
+            target_gripper = OPEN_GRIPPER
+            if brain_runtime.stats["accepted"] % CAPTURE_INTERVAL == 0:
+                print(
+                    "grasp_readiness_gate "
+                    f"phase={phase} distance={distance:.4f}m "
+                    f"limit={args.grasp_attach_distance:.4f}m "
+                    "gripper=OPEN",
+                    flush=True,
+                )
     if payload_state["held"] and phase not in {"open_gripper", "retreat_after_release"}:
         target_gripper = CLOSED_GRIPPER
     return np.asarray(target_arm, dtype=float), float(target_gripper)
@@ -2027,11 +3152,195 @@ def update_attached_payload():
     cube.set_world_pose(position=target_position)
     cube.set_linear_velocity(np.zeros(3))
     cube.set_angular_velocity(np.zeros(3))
+    samples = payload_state.setdefault("motion_samples", [])
+    samples.append(np.asarray(target_position, dtype=float))
+    if len(samples) > 12:
+        del samples[:-12]
+
+
+def inherited_payload_velocity(sample_count=6):
+    samples = payload_state.get("motion_samples") or []
+    if len(samples) < 2:
+        return None
+    window = samples[-max(2, int(sample_count)) :]
+    frame_delta = max(len(window) - 1, 1)
+    velocity = (np.asarray(window[-1]) - np.asarray(window[0])) * (
+        PHYSICS_FPS / frame_delta
+    )
+    if not np.all(np.isfinite(velocity)):
+        return None
+    return velocity
 
 
 def tcp_to_cube_distance():
     cube_position = np.asarray(cube.get_world_pose()[0], dtype=float)
     return float(np.linalg.norm(cube_position - grasp_center_position()))
+
+
+def grasp_center_distance_to(target_position):
+    return float(
+        np.linalg.norm(
+            np.asarray(grasp_center_position(), dtype=float)
+            - np.asarray(target_position, dtype=float)
+        )
+    )
+
+
+def brain_phase_hold_enabled():
+    return (
+        brain_runtime is not None
+        and args.brain_control in {"filtered", "direct"}
+        and int(args.brain_phase_hold_frames) > 0
+        and args.grasp_mode != "teleport"
+    )
+
+
+def brain_phase_hold_target(phase_name):
+    cube_position = np.asarray(cube.get_world_pose()[0], dtype=float)
+    if phase_name == "approach_cube":
+        hover_target = grasp_target_for_cube(cube_position)
+        hover_target[2] += float(args.vertical_grasp_hover_height)
+        return hover_target, float(args.brain_approach_ready_distance)
+    if phase_name == "descend_to_cube":
+        return grasp_target_for_cube(cube_position), float(args.brain_descend_ready_distance)
+    return None, None
+
+
+def curobo_reference_recovery_target(trajectory, lookahead=2):
+    trajectory = np.asarray(trajectory, dtype=float)
+    if trajectory.ndim != 2 or len(trajectory) == 0:
+        raise ValueError("cuRobo recovery trajectory must contain joint waypoints")
+    current_arm = arm_positions()
+    distances = np.linalg.norm(trajectory - current_arm[None, :], axis=1)
+    nearest_index = int(np.argmin(distances))
+    target_index = min(nearest_index + max(int(lookahead), 0), len(trajectory) - 1)
+    return trajectory[target_index], nearest_index, target_index
+
+
+def hold_brain_phase_until_ready(phase_name, trajectory, gripper_position):
+    if not brain_phase_hold_enabled():
+        return True
+    target, threshold = brain_phase_hold_target(phase_name)
+    if target is None:
+        return True
+    max_frames = max(int(args.brain_phase_hold_frames), 0)
+    best_distance = float("inf")
+    for frame in range(max_frames + 1):
+        distance = grasp_center_distance_to(target)
+        if np.isfinite(distance):
+            best_distance = min(best_distance, distance)
+        if distance <= threshold:
+            print(
+                "brain_phase_hold_ready "
+                f"phase={phase_name} frames={frame} "
+                f"distance={distance:.4f}m threshold={threshold:.4f}m",
+                flush=True,
+            )
+            return True
+        if frame >= max_frames:
+            break
+        if frame % CAPTURE_INTERVAL == 0:
+            print(
+                "brain_phase_hold "
+                f"phase={phase_name} frame={frame}/{max_frames} "
+                f"distance={distance:.4f}m threshold={threshold:.4f}m",
+                flush=True,
+            )
+        recovery_target, nearest_index, target_index = (
+            curobo_reference_recovery_target(trajectory)
+        )
+        if frame % CAPTURE_INTERVAL == 0:
+            print(
+                "brain_phase_teacher "
+                f"phase={phase_name} nearest={nearest_index} "
+                f"lookahead={target_index}",
+                flush=True,
+            )
+        if not step_for(1, recovery_target, gripper_position, phase_name):
+            return False
+    payload_state["last_failure"] = (
+        "brain_phase_hold_rejected: "
+        f"phase={phase_name} distance_m={distance:.4f} "
+        f"threshold_m={threshold:.4f}"
+    )
+    print(
+        "brain_phase_hold_rejected "
+        f"phase={phase_name} frames={max_frames} "
+        f"distance={distance:.4f}m threshold={threshold:.4f}m "
+        f"best={best_distance:.4f}m",
+        flush=True,
+    )
+    return False
+
+
+def warmup_brain_runtime(phase_name="approach_cube"):
+    if brain_runtime is None or args.brain_control not in {"filtered", "direct"}:
+        return True
+    if rgb_annotator is None:
+        raise RuntimeError("Brain warmup requires an RGB annotator")
+    brain_runtime.frames = []
+    brain_runtime.latest = None
+    brain_runtime.physics_frame = 0
+    hold_arm = arm_positions()
+    hold_gripper = float(
+        robot.get_joint_positions()[dof_index[GRIPPER_JOINTS[0]]]
+    )
+    max_frames = max(
+        int(brain_runtime.clip_frames * CAPTURE_INTERVAL + CAPTURE_INTERVAL),
+        1,
+    )
+    for frame in range(max_frames):
+        if (
+            control_state["end_requested"]
+            or control_state["retry_requested"]
+            or not app_allows_automation_step()
+        ):
+            return False
+        apply_target(robot, dof_index, hold_arm, hold_gripper)
+        guarded_world_step("brain_warmup")
+        brain_runtime.observe(
+            rgb_annotator,
+            phase_name,
+            current_brain_state(),
+        )
+        if brain_runtime.latest is not None:
+            print(
+                "brain_warmup_ready "
+                f"phase={phase_name} frames={frame + 1} "
+                f"clip_frames={brain_runtime.clip_frames} "
+                f"observe_fps={brain_observe_fps:.1f}",
+                flush=True,
+            )
+            return True
+    payload_state["last_failure"] = (
+        "brain_warmup_rejected: no prediction after "
+        f"{max_frames} physics frames"
+    )
+    raise RuntimeError(payload_state["last_failure"])
+
+
+def ensure_brain_phase_context(phase_name):
+    if (
+        brain_runtime is None
+        or args.brain_control != "direct"
+        or not args.brain_strict_direct
+    ):
+        return True
+    latest = brain_runtime.latest
+    if latest is not None and latest["predicted_phase"] == phase_name:
+        return True
+    return warmup_brain_runtime(phase_name)
+
+
+def update_grasp_readiness():
+    distance = tcp_to_cube_distance()
+    grasp_readiness_state["last_distance_m"] = distance
+    best_distance = grasp_readiness_state["best_distance_m"]
+    if best_distance is None or distance < float(best_distance):
+        grasp_readiness_state["best_distance_m"] = distance
+    if distance <= float(args.grasp_attach_distance):
+        grasp_readiness_state["ready"] = True
+    return distance, bool(grasp_readiness_state["ready"])
 
 
 def begin_payload_grasp():
@@ -2078,9 +3387,10 @@ def begin_payload_grasp():
 
 
 def release_payload():
+    release_position = np.asarray(cube.get_world_pose()[0], dtype=float)
     if payload_state["held"]:
         print(
-            f"grasp_release cube={np.asarray(cube.get_world_pose()[0]).round(4).tolist()}",
+            f"grasp_release cube={release_position.round(4).tolist()}",
             flush=True,
         )
     payload_state["held"] = False
@@ -2093,6 +3403,23 @@ def release_payload():
         int(args.release_cube_clearance_grace_frames),
         0,
     )
+    release_velocity, velocity_source = basket_release_velocity_for(release_position)
+    if release_velocity is not None:
+        release_velocity = np.asarray(release_velocity, dtype=float)
+        if release_velocity.shape != (3,) or not np.all(np.isfinite(release_velocity)):
+            raise ValueError(
+                "Basket release velocity must contain three finite values"
+            )
+        cube.set_linear_velocity(release_velocity)
+        cube.set_angular_velocity(np.zeros(3))
+        payload_state["release_velocity_mps"] = release_velocity.tolist()
+        payload_state["release_velocity_source"] = velocity_source
+        print(
+            "basket_release_velocity "
+            f"source={velocity_source} "
+            f"velocity={release_velocity.round(4).tolist()}",
+            flush=True,
+        )
 
 
 def step_for(frames, arm_positions, gripper_position, phase):
@@ -2100,12 +3427,17 @@ def step_for(frames, arm_positions, gripper_position, phase):
         if (
             control_state["end_requested"]
             or control_state["retry_requested"]
-            or not app.is_running()
+            or not app_allows_automation_step()
         ):
             return False
-        control_arm, control_gripper = choose_control_target(
+        teacher_arm, teacher_gripper = corrective_grasp_teacher_target(
             arm_positions,
             gripper_position,
+            phase,
+        )
+        control_arm, control_gripper = choose_control_target(
+            teacher_arm,
+            teacher_gripper,
             phase,
         )
         apply_target(
@@ -2114,12 +3446,23 @@ def step_for(frames, arm_positions, gripper_position, phase):
             control_arm,
             control_gripper,
         )
-        guarded_world_step(phase)
+        try:
+            guarded_world_step(phase)
+        except RuntimeError:
+            capture_step(
+                phase,
+                teacher_arm,
+                teacher_gripper,
+                control_arm,
+                control_gripper,
+                clearance_state["last_violation"],
+            )
+            raise
         update_attached_payload()
         capture_step(
             phase,
-            arm_positions,
-            gripper_position,
+            teacher_arm,
+            teacher_gripper,
             control_arm,
             control_gripper,
         )
@@ -2146,12 +3489,12 @@ def ik_arm_for_tcp(target_position, current_arm):
     return ik_arm
 
 
-def step_direct_target(frames, arm_positions, gripper_position, phase):
+def step_direct_target(frames, arm_positions, gripper_position, phase, capture=True):
     for _ in range(frames):
         if (
             control_state["end_requested"]
             or control_state["retry_requested"]
-            or not app.is_running()
+            or not app_allows_automation_step()
         ):
             return False
         apply_target(
@@ -2162,13 +3505,233 @@ def step_direct_target(frames, arm_positions, gripper_position, phase):
         )
         guarded_world_step(phase)
         update_attached_payload()
-        capture_step(
-            phase,
-            arm_positions,
-            gripper_position,
+        if capture:
+            capture_step(
+                phase,
+                arm_positions,
+                gripper_position,
+                arm_positions,
+                gripper_position,
+            )
+    return True
+
+
+def step_physics_only(frames, arm_positions, gripper_position, phase):
+    for frame_index in range(frames):
+        if (
+            control_state["end_requested"]
+            or control_state["retry_requested"]
+            or not app_allows_automation_step()
+        ):
+            return False
+        apply_target(
+            robot,
+            dof_index,
             arm_positions,
             gripper_position,
         )
+        world.step(render=should_render_world())
+        if phase == "basket_flight" and frame_index % max(PHYSICS_FPS // 2, 1) == 0:
+            cube_position = np.asarray(cube.get_world_pose()[0], dtype=float)
+            distance = basket_distance_for_position(cube_position)
+            if status_label is not None:
+                status_label.text = (
+                    "Basket flight "
+                    f"{frame_index}/{frames}"
+                    + (
+                        f" distance={distance:.3f}m"
+                        if distance is not None
+                        else ""
+                    )
+                )
+            print(
+                "basket_flight "
+                f"frame={frame_index} "
+                f"cube={cube_position.round(4).tolist()} "
+                + (
+                    f"distance={distance:.4f}m"
+                    if distance is not None
+                    else ""
+                ),
+                flush=True,
+            )
+        if payload_state.get("release_clearance_grace_frames", 0) > 0:
+            payload_state["release_clearance_grace_frames"] -= 1
+    return True
+
+
+def step_basket_kinematic_flight(frames, arm_positions, gripper_position):
+    release_position = np.asarray(cube.get_world_pose()[0], dtype=float)
+    release_velocity = payload_state.get("release_velocity_mps")
+    if release_velocity is None:
+        release_velocity = payload_state.get("gripper_throw_velocity_mps")
+    if release_velocity is None:
+        print("basket_flight_skipped reason=no_release_velocity", flush=True)
+        return True
+    release_velocity = np.asarray(release_velocity, dtype=float)
+    if release_velocity.shape != (3,) or not np.all(np.isfinite(release_velocity)):
+        raise ValueError(
+            "Basket kinematic flight requires a finite 3D release velocity"
+        )
+    gravity = np.asarray([0.0, 0.0, -9.81], dtype=float)
+    dt = 1.0 / float(PHYSICS_FPS)
+    basket_center = (
+        np.asarray(basket_config.get("center", metadata["place_position"]), dtype=float)
+        if basket_config is not None
+        else None
+    )
+    rim_z = (
+        float(basket_center[2]) + float(basket_config.get("wall_height", 0.08))
+        if basket_center is not None
+        else None
+    )
+    landing_position = basket_landing_position()
+    landed = False
+    print(
+        "basket_kinematic_flight_start "
+        f"frames={frames} "
+        f"position={release_position.round(4).tolist()} "
+        f"velocity={release_velocity.round(4).tolist()}",
+        flush=True,
+    )
+    for frame_index in range(frames):
+        if (
+            control_state["end_requested"]
+            or control_state["retry_requested"]
+            or not app_allows_automation_step()
+        ):
+            return False
+        apply_target(
+            robot,
+            dof_index,
+            arm_positions,
+            gripper_position,
+        )
+        if landed:
+            position = landing_position.copy()
+        else:
+            t = (frame_index + 1) * dt
+            position = release_position + release_velocity * t + 0.5 * gravity * t * t
+            distance = basket_distance_for_position(position)
+            if (
+                landing_position is not None
+                and rim_z is not None
+                and distance is not None
+                and distance <= basket_success_distance()
+                and position[2] <= rim_z + float(metadata["cube_size"])
+            ):
+                landed = True
+                payload_state["basket_landed"] = True
+                position = landing_position.copy()
+                cube.set_linear_velocity(np.zeros(3))
+                cube.set_angular_velocity(np.zeros(3))
+                print(
+                    "basket_landed "
+                    f"frame={frame_index + 1} "
+                    f"cube={position.round(4).tolist()} "
+                    f"distance={distance:.4f}m",
+                    flush=True,
+                )
+        cube.set_world_pose(position=position)
+        app.update()
+        distance = basket_distance_for_position(position)
+        if frame_index % max(PHYSICS_FPS // 2, 1) == 0 or frame_index == frames - 1:
+            if status_label is not None:
+                status_label.text = (
+                    "Basket flight "
+                    f"{frame_index + 1}/{frames}"
+                    + (
+                        f" distance={distance:.3f}m"
+                        if distance is not None
+                        else ""
+                    )
+                )
+            print(
+                "basket_flight "
+                f"frame={frame_index + 1} "
+                f"cube={position.round(4).tolist()} "
+                + (
+                    f"distance={distance:.4f}m"
+                    if distance is not None
+                    else ""
+                ),
+                flush=True,
+            )
+    return True
+
+
+def run_basket_gripper_throw():
+    if (
+        task_name != "basket_drop"
+        or basket_config is None
+        or args.basket_velocity_mode != "gripper"
+        or args.grasp_mode == "teleport"
+        or not payload_state["held"]
+    ):
+        return True
+    release_position = np.asarray(cube.get_world_pose()[0], dtype=float)
+    basket_center = np.asarray(
+        basket_config.get("center", metadata["place_position"]),
+        dtype=float,
+    )
+    delta = basket_center - release_position
+    horizontal_distance = float(np.linalg.norm(delta[:2]))
+    if not np.isfinite(horizontal_distance) or horizontal_distance <= 1e-5:
+        return True
+    throw_direction = np.array(
+        [delta[0] / horizontal_distance, delta[1] / horizontal_distance, 0.0],
+        dtype=float,
+    )
+    frames = max(int(args.basket_gripper_throw_frames), 2)
+    tcp_position, _ = current_tcp_pose()
+    current_arm = arm_positions()
+    swing_distance = float(args.basket_gripper_throw_speed_scale) * min(
+        horizontal_distance,
+        0.45,
+    )
+    swing_distance = float(np.clip(swing_distance, 0.055, 0.18))
+    swing_lift = float(np.clip(float(args.basket_gripper_throw_lift), 0.0, 0.14))
+    target_tcp = (
+        np.asarray(tcp_position, dtype=float)
+        + throw_direction * swing_distance
+        + np.array([0.0, 0.0, swing_lift], dtype=float)
+    )
+    target_arm = ik_arm_for_tcp(target_tcp, current_arm)
+    if target_arm is None:
+        print(
+            "basket_gripper_throw_skipped reason=ik_unavailable "
+            f"target_tcp={target_tcp.round(4).tolist()}",
+            flush=True,
+        )
+        return True
+    payload_state["motion_samples"] = []
+    print(
+        "basket_gripper_throw "
+        f"frames={frames} release={release_position.round(4).tolist()} "
+        f"basket={basket_center.round(4).tolist()} "
+        f"swing_distance={swing_distance:.4f}m lift={swing_lift:.4f}m",
+        flush=True,
+    )
+    if not step_direct_target(
+        frames,
+        target_arm,
+        CLOSED_GRIPPER,
+        "basket_gripper_throw",
+    ):
+        return False
+    inherited = inherited_payload_velocity()
+    if inherited is not None:
+        payload_state["gripper_throw_velocity_mps"] = inherited.tolist()
+    payload_state["basket_release_arm_positions"] = np.asarray(
+        target_arm,
+        dtype=float,
+    ).tolist()
+    print(
+        "basket_gripper_throw_complete "
+        f"inherited_velocity="
+        f"{None if inherited is None else inherited.round(4).tolist()}",
+        flush=True,
+    )
     return True
 
 
@@ -2227,6 +3790,17 @@ def run_vertical_grasp_approach(gripper_position):
 
 def close_gripper_in_place(frames, gripper_position):
     current_arm = arm_positions()
+    if (
+        brain_runtime is not None
+        and args.brain_control == "direct"
+        and args.brain_strict_direct
+    ):
+        return step_for(
+            frames,
+            current_arm,
+            gripper_position,
+            "close_gripper",
+        )
     return step_direct_target(
         frames,
         current_arm,
@@ -2235,13 +3809,91 @@ def close_gripper_in_place(frames, gripper_position):
     )
 
 
+def corrective_grasp_teacher_target(fallback_arm, fallback_gripper, phase):
+    if (
+        brain_runtime is None
+        or args.brain_control not in {"filtered", "direct"}
+        or args.grasp_mode == "teleport"
+        or payload_state["held"]
+        or phase not in {"descend_to_cube", "close_gripper"}
+    ):
+        return np.asarray(fallback_arm, dtype=float), float(fallback_gripper)
+    cube_position = np.asarray(cube.get_world_pose()[0], dtype=float)
+    grasp_center_target = grasp_target_for_cube(cube_position)
+    current_grasp_center = np.asarray(grasp_center_position(), dtype=float)
+    xy_distance = float(
+        np.linalg.norm(current_grasp_center[:2] - grasp_center_target[:2])
+    )
+    if xy_distance > float(args.vertical_grasp_xy_tolerance):
+        grasp_center_target = grasp_center_target.copy()
+        grasp_center_target[2] += float(args.vertical_grasp_hover_height)
+    tcp_position, tcp_rotation = current_tcp_pose()
+    target_tcp = grasp_center_target - local_grasp_offset_world(tcp_rotation)
+    current_arm = arm_positions()
+    ik_arm = ik_arm_for_tcp(target_tcp, current_arm)
+    if ik_arm is None:
+        return np.asarray(fallback_arm, dtype=float), float(fallback_gripper)
+    distance = float(
+        np.linalg.norm(np.asarray(grasp_center_position(), dtype=float) - cube_position)
+    )
+    if distance > float(args.grasp_attach_distance):
+        target_gripper = OPEN_GRIPPER
+    else:
+        target_gripper = float(fallback_gripper)
+    return np.asarray(ik_arm, dtype=float), float(target_gripper)
+
+
 def align_for_no_teleport_grasp(arm_positions, gripper_position):
-    if not args.brain_terminal_servo or args.grasp_mode == "teleport":
+    if args.grasp_mode == "teleport":
         return True
     target_distance = float(args.grasp_attach_distance) * 0.85
+    distance, ready = update_grasp_readiness()
+    if ready:
+        print(
+            "grasp_readiness_aligned "
+            f"frames=0 distance={distance:.4f}m "
+            f"target={target_distance:.4f}m",
+            flush=True,
+        )
+        return True
+    if not args.brain_terminal_servo:
+        if (
+            args.disable_brain_grasp_readiness_gate
+            or brain_runtime is None
+            or args.brain_control not in {"filtered", "direct"}
+        ):
+            return True
+        max_frames = max(int(args.brain_grasp_readiness_frames), 0)
+        for frame in range(max_frames):
+            distance, ready = update_grasp_readiness()
+            if ready:
+                print(
+                    "brain_grasp_readiness_aligned "
+                    f"frames={frame} distance={distance:.4f}m "
+                    f"limit={args.grasp_attach_distance:.4f}m",
+                    flush=True,
+                )
+                return True
+            if not step_for(1, arm_positions, OPEN_GRIPPER, "descend_to_cube"):
+                return False
+        distance, _ = update_grasp_readiness()
+        payload_state["attach_distance_m"] = distance
+        payload_state["last_failure"] = (
+            "grasp_readiness_rejected: "
+            f"tcp_to_cube_distance_m={distance:.4f} "
+            f"limit_m={args.grasp_attach_distance:.4f}"
+        )
+        print(
+            "grasp_readiness_rejected "
+            f"frames={max_frames} distance={distance:.4f}m "
+            f"limit={args.grasp_attach_distance:.4f}m "
+            f"best={grasp_readiness_state['best_distance_m']:.4f}m",
+            flush=True,
+        )
+        return False
     max_frames = max(int(args.brain_terminal_servo_align_frames), 0)
     for frame in range(max_frames):
-        distance = tcp_to_cube_distance()
+        distance, ready = update_grasp_readiness()
         if distance <= target_distance:
             print(
                 "terminal_servo_aligned "
@@ -2314,6 +3966,12 @@ def reset_cycle():
     payload_state["teleport_shortcut_used"] = False
     payload_state["last_failure"] = None
     payload_state["release_clearance_grace_frames"] = 0
+    payload_state["motion_samples"] = []
+    payload_state["release_velocity_mps"] = None
+    payload_state["release_velocity_source"] = None
+    payload_state["gripper_throw_velocity_mps"] = None
+    payload_state["basket_release_arm_positions"] = None
+    payload_state["basket_landed"] = False
     clearance_state["min_clearance_m"] = None
     clearance_state["min_cube_clearance_m"] = None
     clearance_state["last_violation"] = None
@@ -2338,11 +3996,6 @@ def detect_and_plan():
     current_arm_positions = arm_positions()
     for _ in range(PHYSICS_FPS // 4):
         guarded_world_step("conveyor_return")
-        capture_step(
-            "observe_cube",
-            current_arm_positions,
-            OPEN_GRIPPER,
-        )
     detected_position = np.asarray(cube.get_world_pose()[0], dtype=float)
     recorder = recording_state["recorder"]
     if recorder is not None:
@@ -2437,6 +4090,9 @@ def detect_and_plan():
 
 def run_pick_and_place(trajectories):
     gripper_position = OPEN_GRIPPER
+    grasp_readiness_state["ready"] = False
+    grasp_readiness_state["best_distance_m"] = None
+    grasp_readiness_state["last_distance_m"] = None
     for phase_name in phase_names:
         trajectory = np.asarray(trajectories[phase_name])
         if status_label is not None:
@@ -2455,6 +4111,8 @@ def run_pick_and_place(trajectories):
             continue
 
         if phase_name == "lift_cube":
+            if not ensure_brain_phase_context("descend_to_cube"):
+                return False
             if not run_vertical_grasp_approach(OPEN_GRIPPER):
                 return False
             if not align_for_no_teleport_grasp(
@@ -2462,9 +4120,26 @@ def run_pick_and_place(trajectories):
                 OPEN_GRIPPER,
             ):
                 return False
+            if not ensure_brain_phase_context("close_gripper"):
+                return False
             gripper_position = CLOSED_GRIPPER
             if not close_gripper_in_place(100, gripper_position):
                 return False
+            if (
+                args.brain_control == "direct"
+                and args.brain_strict_direct
+            ):
+                actual_gripper = float(
+                    robot.get_joint_positions()[dof_index[GRIPPER_JOINTS[0]]]
+                )
+                if actual_gripper < CLOSED_GRIPPER * 0.70:
+                    payload_state["last_failure"] = (
+                        "brain_gripper_close_rejected: "
+                        f"actual={actual_gripper:.4f} "
+                        f"required={CLOSED_GRIPPER * 0.70:.4f}"
+                    )
+                    print(payload_state["last_failure"], flush=True)
+                    return False
             if not begin_payload_grasp():
                 return False
         elif phase_name == "retreat_after_release":
@@ -2473,16 +4148,76 @@ def run_pick_and_place(trajectories):
                 gripper_position,
             ):
                 return False
-            gripper_position = OPEN_GRIPPER
-            if not step_for(
-                90,
-                trajectory[0],
-                gripper_position,
-                "open_gripper",
-            ):
+            if not ensure_brain_phase_context("open_gripper"):
                 return False
-            release_payload()
+            if not run_basket_gripper_throw():
+                return False
+            gripper_position = OPEN_GRIPPER
+            if task_name == "basket_drop" and args.basket_velocity_mode == "gripper":
+                release_open_frames = max(
+                    int(args.basket_gripper_release_open_frames),
+                    0,
+                )
+                basket_hold_arm = payload_state.get(
+                    "basket_release_arm_positions"
+                )
+                if basket_hold_arm is None:
+                    basket_hold_arm = trajectory[0]
+                basket_hold_arm = np.asarray(basket_hold_arm, dtype=float)
+                release_payload()
+                if release_open_frames > 0:
+                    print(
+                        "basket_throw_release_open "
+                        f"frames={release_open_frames}",
+                        flush=True,
+                    )
+                if release_open_frames > 0 and not step_physics_only(
+                    release_open_frames,
+                    basket_hold_arm,
+                    gripper_position,
+                    "open_gripper_after_throw_release",
+                ):
+                    return False
+                settle_frames = max(
+                    int(args.basket_flight_settle_frames),
+                    int(args.basket_min_flight_frames),
+                    0,
+                )
+                if settle_frames > 0:
+                    print(
+                        "basket_flight_wait "
+                        f"frames={settle_frames} "
+                        f"mode={args.basket_flight_mode}",
+                        flush=True,
+                    )
+                if settle_frames > 0:
+                    if args.basket_flight_mode == "kinematic":
+                        if not step_basket_kinematic_flight(
+                            settle_frames,
+                            basket_hold_arm,
+                            OPEN_GRIPPER,
+                        ):
+                            return False
+                    elif not step_physics_only(
+                        settle_frames,
+                        basket_hold_arm,
+                        OPEN_GRIPPER,
+                        "basket_flight",
+                    ):
+                        return False
+                continue
+            else:
+                if not step_for(
+                    90,
+                    trajectory[0],
+                    gripper_position,
+                    "open_gripper",
+                ):
+                    return False
+                release_payload()
 
+        if not ensure_brain_phase_context(phase_name):
+            return False
         for arm_positions in trajectory:
             if not step_for(
                 max(args.steps_per_waypoint, 1),
@@ -2491,12 +4226,28 @@ def run_pick_and_place(trajectories):
                 phase_name,
             ):
                 return False
+        if phase_name in {"approach_cube", "descend_to_cube"}:
+            if not hold_brain_phase_until_ready(
+                phase_name,
+                trajectory,
+                gripper_position,
+            ):
+                return False
 
     final_cube = np.asarray(cube.get_world_pose()[0])
-    place_position = np.asarray(metadata["place_position"])
+    place_position = task_success_position()
     place_distance = float(
         np.linalg.norm(final_cube[:2] - place_position[:2])
     )
+    basket_distance = basket_distance_for_position(final_cube)
+    success_distance = (
+        basket_success_distance()
+        if basket_distance is not None
+        else float(args.task_success_distance)
+    )
+    task_target_reached = place_distance < success_distance
+    if basket_distance is not None and payload_state.get("basket_landed"):
+        task_target_reached = True
     lifted_height = (
         float(payload_state["max_cube_height_m"])
         - float(cube_initial_position[2])
@@ -2504,15 +4255,58 @@ def run_pick_and_place(trajectories):
     print(
         f"playback_complete cube={final_cube.round(4).tolist()} "
         f"place_distance={place_distance:.4f}m "
-        f"lifted_height={lifted_height:.4f}m",
+        f"lifted_height={lifted_height:.4f}m"
+        + (
+            f" basket_distance={basket_distance:.4f}m"
+            if basket_distance is not None
+            else ""
+        ),
         flush=True,
     )
     if status_label is not None:
-        status_label.text = "Conveyor returning cube..."
+        if basket_distance is not None:
+            status_label.text = (
+                "Basket throw complete"
+                if task_target_reached
+                else "Basket throw missed"
+            )
+        else:
+            status_label.text = "Conveyor returning cube..."
     return {
-        "placed_at_start": place_distance < 0.10,
+        "placed_at_start": task_target_reached,
+        "task_target_reached": task_target_reached,
         "start_place_distance_m": place_distance,
         "cube_at_start": final_cube.tolist(),
+        "task_success_position": place_position.tolist(),
+        "basket_distance_m": basket_distance,
+        "basket_success_distance_m": (
+            basket_success_distance()
+            if basket_distance is not None
+            else None
+        ),
+        "basket_success": (
+            task_target_reached
+            if basket_distance is not None
+            else None
+        ),
+        "basket_landed": (
+            bool(payload_state.get("basket_landed"))
+            if basket_distance is not None
+            else None
+        ),
+        "basket_center": (
+            np.asarray(basket_config["center"], dtype=float).tolist()
+            if task_name == "basket_drop" and basket_config is not None
+            else None
+        ),
+        "basket_release_velocity": (
+            payload_state["release_velocity_mps"]
+            if task_name == "basket_drop"
+            else None
+        ),
+        "basket_release_velocity_source": payload_state[
+            "release_velocity_source"
+        ],
         "grasp_mode": args.grasp_mode,
         "grasp_attach_distance_m": payload_state["attach_distance_m"],
         "max_cube_height_m": float(payload_state["max_cube_height_m"]),
@@ -2540,7 +4334,7 @@ def return_cube_on_conveyor(hold_positions):
         if (
             control_state["end_requested"]
             or control_state["retry_requested"]
-            or not app.is_running()
+            or not app_allows_automation_step()
         ):
             set_conveyor_speed(conveyor_graph_nodes, 0.0)
             return False
@@ -2613,12 +4407,13 @@ def return_cube_on_conveyor(hold_positions):
 
 
 try:
+    warmup_simulation_app()
     reset_cycle()
     completed_cycles = 0
     dataset_completed = existing_successful_episodes
     failed_attempts = 0
     update_dataset_manifest(failed_attempts)
-    while app.is_running():
+    while app_allows_automation_step():
         if control_state["end_requested"]:
             break
         if (
@@ -2651,20 +4446,36 @@ try:
             )
         try:
             trajectories = detect_and_plan()
+            if not warmup_brain_runtime("approach_cube"):
+                raise RuntimeError("Brain temporal warmup was interrupted")
             pick_metrics = run_pick_and_place(trajectories)
             if not pick_metrics:
                 raise RuntimeError("Pick-and-place was interrupted")
             if not pick_metrics["placed_at_start"]:
                 raise RuntimeError(
-                    "Cube was not placed at the conveyor start: "
+                    "Cube was not placed at the task target: "
                     f"distance={pick_metrics['start_place_distance_m']:.4f}m"
                 )
             hold_positions = np.asarray(
                 trajectories["retreat_after_release"]
             )[-1]
-            conveyor_metrics = return_cube_on_conveyor(hold_positions)
-            if not conveyor_metrics:
-                raise RuntimeError("Conveyor return was interrupted")
+            if args.disable_conveyor_return or task_name == "basket_drop":
+                conveyor_metrics = {
+                    "returned_to_end": False,
+                    "conveyor_return_seconds": 0.0,
+                    "final_cube_position": pick_metrics["cube_at_start"],
+                    "final_end_distance_m": None,
+                    "conveyor_return_disabled": True,
+                    "conveyor_return_skip_reason": (
+                        "basket_drop"
+                        if task_name == "basket_drop"
+                        else "disabled_by_arg"
+                    ),
+                }
+            else:
+                conveyor_metrics = return_cube_on_conveyor(hold_positions)
+                if not conveyor_metrics:
+                    raise RuntimeError("Conveyor return was interrupted")
             recorder = recording_state["recorder"]
             while (
                 recorder is not None
@@ -2732,15 +4543,20 @@ try:
                         cube.get_world_pose()[0],
                         dtype=float,
                     )
-                    failure_place_position = np.asarray(
-                        metadata["place_position"],
-                        dtype=float,
-                    )
+                    failure_place_position = task_success_position()
                     failure_place_distance = float(
                         np.linalg.norm(
                             failure_cube_position[:2]
                             - failure_place_position[:2]
                         )
+                    )
+                    failure_basket_distance = basket_distance_for_position(
+                        failure_cube_position
+                    )
+                    failure_success_distance = (
+                        basket_success_distance()
+                        if failure_basket_distance is not None
+                        else float(args.task_success_distance)
                     )
                     failure_lifted_height = (
                         float(payload_state["max_cube_height_m"])
@@ -2763,7 +4579,24 @@ try:
                         "start_place_distance_m": failure_place_distance,
                         "cube_at_failure": failure_cube_position.tolist(),
                         "place_position": failure_place_position.tolist(),
-                        "placed_at_start": failure_place_distance < 0.10,
+                        "placed_at_start": failure_place_distance
+                        < failure_success_distance,
+                        "basket_distance_m": failure_basket_distance,
+                        "basket_success_distance_m": (
+                            basket_success_distance()
+                            if failure_basket_distance is not None
+                            else None
+                        ),
+                        "basket_success": (
+                            failure_place_distance < failure_success_distance
+                            if failure_basket_distance is not None
+                            else None
+                        ),
+                        "basket_landed": (
+                            bool(payload_state.get("basket_landed"))
+                            if failure_basket_distance is not None
+                            else None
+                        ),
                         "lifted_height_m": failure_lifted_height,
                         "lifted_without_teleport": (
                             failure_lifted_height > 0.10
@@ -2806,8 +4639,7 @@ try:
                 flush=True,
             )
             if (
-                args.headless
-                and target_episode_total is None
+                (args.headless or args.stop_after_cycles)
                 and failed_attempts + completed_cycles >= max(args.cycles, 1)
             ):
                 break
@@ -2819,7 +4651,7 @@ try:
             continue
 
         if (
-            args.headless
+            (args.headless or args.stop_after_cycles)
             and target_episode_total is None
             and completed_cycles >= max(args.cycles, 1)
         ):

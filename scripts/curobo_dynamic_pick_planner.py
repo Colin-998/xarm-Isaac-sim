@@ -148,6 +148,12 @@ parser.add_argument(
     help="Detected cube center as x,y,z in metres.",
 )
 parser.add_argument(
+    "--place-position",
+    type=lambda value: parse_vector(value, 3),
+    default=None,
+    help="Task target cube center as x,y,z in metres. Defaults to conveyor start.",
+)
+parser.add_argument(
     "--obstacles-json",
     type=Path,
     help="JSON list with obstacle name, position and dims/scale.",
@@ -165,7 +171,7 @@ cube_position = args.cube_position or arc_position(
     math.radians(105.0),
     BELT_HEIGHT + args.cube_size,
 )
-place_position = arc_position(
+place_position = args.place_position or arc_position(
     BELT_START_ANGLE,
     BELT_HEIGHT + args.cube_size,
 )
